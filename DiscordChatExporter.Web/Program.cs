@@ -33,6 +33,12 @@ var allowedHosts =
     Environment.GetEnvironmentVariable("DCE_ALLOWED_HOSTS") ?? "localhost;127.0.0.1;[::1]";
 builder.Configuration["AllowedHosts"] = allowedHosts;
 
+// Accept and emit enums as their names (e.g. "Mine", "Json") in JSON, so the browser can send
+// readable values instead of magic numbers.
+builder.Services.ConfigureHttpJsonOptions(o =>
+    o.SerializerOptions.Converters.Add(new System.Text.Json.Serialization.JsonStringEnumConverter())
+);
+
 var accessGate = AccessGate.CreateOrFromEnvironment();
 builder.Services.AddSingleton(accessGate);
 builder.Services.AddSingleton<DiscordSession>();

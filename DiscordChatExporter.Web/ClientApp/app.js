@@ -233,9 +233,9 @@ async function showExportSetup(guild) {
 
   btn.addEventListener("click", async () => {
     const formats = [];
-    if (fmtHtml.checked) formats.push(1);
-    if (fmtJson.checked) formats.push(4);
-    if (!formats.length) formats.push(1);
+    if (fmtHtml.checked) formats.push("HtmlDark");
+    if (fmtJson.checked) formats.push("Json");
+    if (!formats.length) formats.push("HtmlDark");
 
     const channelIds = chanPick.checked
       ? Object.entries(channelChecks).filter(([, cb]) => cb.checked).map(([id]) => id)
@@ -389,8 +389,100 @@ async function showRun(runId) {
   chanCard.append(tbl);
   view.append(chanCard);
 
+  view.append(messageBrowserCard(runId, data.channels));
   view.append(deletionCard(runId, run, data.channels));
   render(view);
+}
+
+// ---- message browser: click to protect individual messages ---------------------------------
+
+function messageBrowserCard(runId, channels) {
+  const myId = state.session.user.id;
+  const channelName = Object.fromEntries(channels.map((c) => [c.id, c.name]));
+
+  const channelSel = el("select", {}, el("option", { value: "" }, "All channels"), ...channels.map((c) => el("option", { value: c.id }, c.name)));
+  const search = el("input", { type: "search", placeholder: "Search message text…" });
+  const onlyMine = el("input", { type: "checkbox" });
+  const keptOnly = el("input", { type: "checkbox" });
+  const loadBtn = el("button", { class: "secondary" }, "Search");
+  const moreBtn = el("button", { class: "secondary hidden" }, "Load more");
+  const info = el("div", { class: "muted small" });
+
+  const tbl = el("table", {}, el("tr", {}, el("th", {}, "Protect"), el("th", {}, "Author"), el("th", {}, "When"), el("th", {}, "Channel"), el("th", {}, "Message")));
+  const body = el("tbody", {});
+  tbl.append(body);
+
+  let cursor = 0;
+
+  function row(m) {
+    const cb = el("input", { type: "checkbox", title: "Protect this message from deletion" });
+    cb.checked = m.keep;
+    cb.addEventListener("change", async () => {
+      cb.disabled = true;
+      try {
+        await api.put(`/api/exports/${runId}/messages/${m.id}/keep`, { keep: cb.checked });
+      } catch (e) {
+        alert(e.message);
+        cb.checked = !cb.checked;
+      }
+      cb.disabled = false;
+    });
+    const when = new Date(m.timestamp).toLocaleString();
+    const deleted = m.deleteStatus === "Deleted" || m.deleteStatus === "Gone";
+    return el(
+      "tr",
+      { class: deleted ? "struck" : "" },
+      el("td", {}, cb),
+      el("td", {}, m.authorName + (m.isPinned ? " 📌" : "")),
+      el("td", { class: "small nowrap" }, when),
+      el("td", { class: "small" }, channelName[m.channelId] || ""),
+      el("td", { class: "msg-content" }, m.content || el("span", { class: "muted" }, "(no text)")),
+    );
+  }
+
+  async function load(reset) {
+    if (reset) {
+      cursor = 0;
+      clear(body);
+    }
+    loadBtn.disabled = true;
+    try {
+      const params = new URLSearchParams();
+      if (channelSel.value) params.set("channel", channelSel.value);
+      if (search.value.trim()) params.set("q", search.value.trim());
+      if (onlyMine.checked) params.set("author", myId);
+      if (keptOnly.checked) params.set("keep", "true");
+      params.set("cursor", cursor);
+      const res = await api.get(`/api/exports/${runId}/messages?` + params.toString());
+      for (const m of res.items) body.append(row(m));
+      info.textContent = `${res.total} message(s) match`;
+      if (res.nextCursor >= 0) {
+        cursor = res.nextCursor;
+        moreBtn.classList.remove("hidden");
+      } else {
+        moreBtn.classList.add("hidden");
+      }
+    } catch (e) {
+      info.textContent = e.message;
+    }
+    loadBtn.disabled = false;
+  }
+
+  loadBtn.addEventListener("click", () => load(true));
+  moreBtn.addEventListener("click", () => load(false));
+  search.addEventListener("keydown", (e) => e.key === "Enter" && load(true));
+
+  return el(
+    "div",
+    { class: "card" },
+    el("h2", {}, "Browse & protect messages"),
+    el("p", { class: "muted" }, "Tick a message to protect it from deletion — no need to copy IDs. Protected messages are kept no matter what the delete filters say."),
+    el("div", { class: "row" }, channelSel, search),
+    el("div", { style: "display:flex; gap:18px; align-items:center; margin:8px 0" }, el("div", { class: "check tight" }, onlyMine, el("label", {}, "Only my messages")), el("div", { class: "check tight" }, keptOnly, el("label", {}, "Only protected")), loadBtn),
+    info,
+    tbl,
+    el("div", { style: "margin-top:10px" }, moreBtn),
+  );
 }
 
 function deletionCard(runId, run, channels) {

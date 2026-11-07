@@ -273,9 +273,17 @@ th {
   font-weight: 600;
 }
 .msg-content {
-  max-width: 420px;
+  max-width: 380px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.nowrap {
+  white-space: nowrap;
+}
+tr.struck td {
+  opacity: 0.4;
+  text-decoration: line-through;
 }
 
 .list-item {
