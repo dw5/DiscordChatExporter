@@ -13,16 +13,44 @@ using PowerKit.Extensions;
 
 namespace DiscordChatExporter.Core.Exporting;
 
-internal class ExportContext(DiscordClient discord, ExportRequest request)
+// When a cache source is provided, the context shares its member, channel, and role caches
+// (and its asset downloader, if the asset settings match). This is used when the same channel
+// is exported into multiple formats at once, to avoid fetching the same data more than once.
+internal class ExportContext(
+    DiscordClient discord,
+    ExportRequest request,
+    ExportContext? cacheSource = null
+)
 {
-    private readonly Dictionary<Snowflake, Member?> _membersById = new();
-    private readonly Dictionary<Snowflake, Channel?> _channelsById = new();
-    private readonly Dictionary<Snowflake, Role> _rolesById = new();
+    private readonly Dictionary<Snowflake, Member?> _membersById =
+        cacheSource?._membersById ?? new();
 
-    private readonly ExportAssetDownloader _assetDownloader = new(
-        request.AssetsDirPath,
-        request.ShouldReuseAssets
-    );
+    private readonly Dictionary<Snowflake, Channel?> _channelsById =
+        cacheSource?._channelsById ?? new();
+
+    private readonly Dictionary<Snowflake, Role> _rolesById = cacheSource?._rolesById ?? new();
+
+    private readonly ExportAssetDownloader _assetDownloader =
+        cacheSource is not null
+        && string.Equals(
+            cacheSource.Request.AssetsDirPath,
+            request.AssetsDirPath,
+            StringComparison.Ordinal
+        )
+        && cacheSource.Request.ShouldReuseAssets == request.ShouldReuseAssets
+            ? cacheSource._assetDownloader
+            : new ExportAssetDownloader(request.AssetsDirPath, request.ShouldReuseAssets);
+
+    private readonly List<string> _failedAssetUrls = [];
+    private readonly Lock _failedAssetUrlsLock = new();
+
+    // URLs of assets that could not be downloaded, in which case the export references
+    // the original URL (or, see ExportRequest.LinkFailedAttachmentsLocally, the expected file path).
+    public IReadOnlyList<string> GetFailedAssetUrls()
+    {
+        lock (_failedAssetUrlsLock)
+            return _failedAssetUrls.ToArray();
+    }
 
     public DiscordClient Discord { get; } = discord;
 
@@ -131,36 +159,59 @@ internal class ExportContext(DiscordClient discord, ExportRequest request)
         try
         {
             var filePath = await _assetDownloader.DownloadAsync(url, cancellationToken);
-            var relativeFilePath = Path.GetRelativePath(Request.OutputDirPath, filePath);
-
-            // Prefer the relative path so that the export package can be copied around without breaking references.
-            // However, if the assets directory lies outside the export directory, use the absolute path instead.
-            var shouldUseAbsoluteFilePath =
-                relativeFilePath.StartsWith(
-                    ".." + Path.DirectorySeparatorChar,
-                    StringComparison.Ordinal
-                )
-                || relativeFilePath.StartsWith(
-                    ".." + Path.AltDirectorySeparatorChar,
-                    StringComparison.Ordinal
-                );
-
-            var optimalFilePath = shouldUseAbsoluteFilePath ? filePath : relativeFilePath;
-
-            // For HTML, the path needs to be properly formatted
-            if (Request.Format is ExportFormat.HtmlDark or ExportFormat.HtmlLight)
-                return Url.EncodeFilePath(optimalFilePath);
-
-            return optimalFilePath;
+            return FormatLocalAssetPath(filePath);
         }
         // Try to catch only exceptions related to failed HTTP requests
         // https://github.com/Tyrrrz/DiscordChatExporter/issues/332
         // https://github.com/Tyrrrz/DiscordChatExporter/issues/372
         catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException)
         {
+            lock (_failedAssetUrlsLock)
+                _failedAssetUrls.Add(url);
+
+            // Point at the location where the file is expected to be, so that the link starts working
+            // as soon as the file gets downloaded there later (e.g., by retrying the failed download).
+            if (
+                Request.LinkFailedAttachmentsLocally
+                && ExportAssetDownloader.IsDiscordAttachmentUrl(url)
+            )
+            {
+                return FormatLocalAssetPath(
+                    Path.Combine(
+                        Request.AssetsDirPath,
+                        ExportAssetDownloader.GetTargetFileName(url)
+                    )
+                );
+            }
+
             // We don't want this to crash the exporting process in case of failure.
             // TODO: add logging so we can be more liberal with catching exceptions.
             return url;
         }
+    }
+
+    private string FormatLocalAssetPath(string filePath)
+    {
+        var relativeFilePath = Path.GetRelativePath(Request.OutputDirPath, filePath);
+
+        // Prefer the relative path so that the export package can be copied around without breaking references.
+        // However, if the assets directory lies outside the export directory, use the absolute path instead.
+        var shouldUseAbsoluteFilePath =
+            relativeFilePath.StartsWith(
+                ".." + Path.DirectorySeparatorChar,
+                StringComparison.Ordinal
+            )
+            || relativeFilePath.StartsWith(
+                ".." + Path.AltDirectorySeparatorChar,
+                StringComparison.Ordinal
+            );
+
+        var optimalFilePath = shouldUseAbsoluteFilePath ? filePath : relativeFilePath;
+
+        // For HTML, the path needs to be properly formatted
+        if (Request.Format is ExportFormat.HtmlDark or ExportFormat.HtmlLight)
+            return Url.EncodeFilePath(optimalFilePath);
+
+        return optimalFilePath;
     }
 }

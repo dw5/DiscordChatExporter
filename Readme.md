@@ -55,6 +55,37 @@ It works with direct messages, group messages, and server channels, and supports
 > [!NOTE]
 > If you're unsure which build is right for your system, consult with [this page](https://useragent.cc) to determine your OS and CPU architecture.
 
+## Web UI (self-hosted)
+
+This fork adds **DiscordChatExporter.Web**, a browser-based UI you run on your own machine. It does one-click "export everything" for a whole server, then lets you **selectively delete** messages — only ever the messages the export already backed up.
+
+> [!WARNING]
+> Deletion is permanent, and automating a user account (including deleting your own messages with a user token) is against Discord's ToS. For a server you administer, prefer a bot token with the **Manage Messages** permission. Always preview and dry-run first.
+
+Run it locally:
+
+```
+dotnet run --project DiscordChatExporter.Web
+# then open the printed http://127.0.0.1:5080/?key=... URL
+```
+
+Or with Docker (keep it bound to loopback):
+
+```
+docker build -f DiscordChatExporter.Web.dockerfile -t dce-web .
+docker run --rm -p 127.0.0.1:5080:5080 -v "$PWD/dce-data:/data" \
+  -e DCE_ACCESS_KEY=pick-a-secret dce-web
+```
+
+How it works and stays safe:
+
+- Binds to `127.0.0.1:5080` by default. Every request needs the access key the app prints at startup (or `DCE_ACCESS_KEY`); it sets a strict cookie, and state-changing requests need a custom header and same-origin check. `DCE_ALLOWED_HOSTS` guards against DNS rebinding.
+- **Export**: pick a server, choose threads/formats/media, click *Export everything*. Each run is written to its own immutable folder under the data dir, with the HTML/JSON files, a `media/` folder, a SQLite `manifest.db`, and a `deletion-log.jsonl` audit trail.
+- **Delete**: choose a scope (your own messages, or everyone's with a bot) and exclusions (channels, pinned, attachments, phrases, specific messages). *Preview* persists the exact candidate set; the real run deletes only those IDs, re-checking each, paced to respect rate limits, resumable, and requires typing the server name to confirm.
+- The token is held in memory only — never written to disk or sent anywhere but Discord.
+
+See [the Web UI docs](.docs/Web-UI.md) for details.
+
 ## Features
 
 - Cross-platform graphical and command-line interfaces

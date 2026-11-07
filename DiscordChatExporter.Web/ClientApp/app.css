@@ -1,0 +1,272 @@
+:root {
+  --bg: #1e1f22;
+  --panel: #2b2d31;
+  --panel-2: #313338;
+  --text: #dbdee1;
+  --muted: #949ba4;
+  --accent: #5865f2;
+  --accent-hover: #4752c4;
+  --danger: #da373c;
+  --danger-hover: #a12828;
+  --ok: #2dc770;
+  --warn: #e8a317;
+  --border: #3f4147;
+  --radius: 8px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    "gg sans", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+#app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px 16px 80px;
+}
+
+h1 {
+  font-size: 20px;
+  margin: 0;
+}
+h2 {
+  font-size: 16px;
+  margin: 0 0 12px;
+}
+
+header.app-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+header.app-bar img {
+  width: 32px;
+  height: 32px;
+}
+header.app-bar .spacer {
+  flex: 1;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px;
+  margin-bottom: 16px;
+}
+
+label {
+  display: block;
+  font-size: 13px;
+  color: var(--muted);
+  margin: 10px 0 4px;
+}
+
+input[type="text"],
+input[type="password"],
+input[type="search"],
+select,
+textarea {
+  width: 100%;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  padding: 9px 11px;
+  font: inherit;
+}
+textarea {
+  min-height: 64px;
+  resize: vertical;
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.row > * {
+  flex: 1;
+  min-width: 180px;
+}
+
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+.check input {
+  width: auto;
+}
+.check label {
+  margin: 0;
+  color: var(--text);
+}
+
+button {
+  background: var(--accent);
+  color: white;
+  border: none;
+  border-radius: 5px;
+  padding: 10px 16px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover {
+  background: var(--accent-hover);
+}
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+button.secondary {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+}
+button.secondary:hover {
+  background: var(--border);
+}
+button.danger {
+  background: var(--danger);
+}
+button.danger:hover {
+  background: var(--danger-hover);
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 13px;
+}
+.pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+}
+.pill.ok {
+  background: rgba(45, 199, 112, 0.15);
+  color: var(--ok);
+}
+.pill.warn {
+  background: rgba(232, 163, 23, 0.15);
+  color: var(--warn);
+}
+.pill.err {
+  background: rgba(218, 55, 60, 0.15);
+  color: var(--danger);
+}
+.pill.muted {
+  background: var(--panel-2);
+  color: var(--muted);
+}
+
+.banner {
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin-bottom: 12px;
+  font-size: 14px;
+}
+.banner.warn {
+  background: rgba(232, 163, 23, 0.12);
+  border: 1px solid var(--warn);
+}
+.banner.danger {
+  background: rgba(218, 55, 60, 0.12);
+  border: 1px solid var(--danger);
+}
+
+.progress {
+  height: 8px;
+  background: var(--panel-2);
+  border-radius: 999px;
+  overflow: hidden;
+  margin: 10px 0;
+}
+.progress > div {
+  height: 100%;
+  background: var(--accent);
+  width: 0;
+  transition: width 0.3s;
+}
+
+.log {
+  background: #111214;
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 12px;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th,
+td {
+  text-align: left;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+th {
+  color: var(--muted);
+  font-weight: 600;
+}
+.msg-content {
+  max-width: 420px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.list-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+.list-item:hover {
+  background: var(--panel-2);
+}
+.list-item .spacer {
+  flex: 1;
+}
+
+.hidden {
+  display: none;
+}
+.stat {
+  font-size: 28px;
+  font-weight: 700;
+}
+.stat-row {
+  display: flex;
+  gap: 24px;
+  margin: 8px 0;
+}
+.stat-row > div {
+  text-align: center;
+}
+a {
+  color: #00a8fc;
+}

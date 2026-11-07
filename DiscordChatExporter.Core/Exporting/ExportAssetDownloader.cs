@@ -13,7 +13,7 @@ using PowerKit.Extensions;
 
 namespace DiscordChatExporter.Core.Exporting;
 
-internal partial class ExportAssetDownloader(string workingDirPath, bool reuse)
+public partial class ExportAssetDownloader(string workingDirPath, bool reuse)
 {
     private static readonly AsyncKeyedLocker<string> Locker = new();
 
@@ -78,8 +78,30 @@ internal partial class ExportAssetDownloader(string workingDirPath, bool reuse)
 
                 response.EnsureSuccessStatusCode();
 
-                await using var output = File.Create(filePath);
-                await response.Content.CopyToAsync(output, innerCancellationToken);
+                // Download to a temporary file first and only move it into place once it's complete,
+                // so that a failed or cancelled download never leaves behind a truncated file that
+                // would later be mistaken for a complete one when reusing assets.
+                var tempFilePath = filePath + ".part-" + Guid.NewGuid().ToString("N");
+                try
+                {
+                    await using (var output = File.Create(tempFilePath))
+                        await response.Content.CopyToAsync(output, innerCancellationToken);
+
+                    File.Move(tempFilePath, filePath, true);
+                }
+                catch
+                {
+                    try
+                    {
+                        File.Delete(tempFilePath);
+                    }
+                    catch (IOException)
+                    {
+                        // Best effort
+                    }
+
+                    throw;
+                }
             },
             cancellationToken
         );
@@ -88,8 +110,27 @@ internal partial class ExportAssetDownloader(string workingDirPath, bool reuse)
     }
 }
 
-internal partial class ExportAssetDownloader
+public partial class ExportAssetDownloader
 {
+    // Name of the file that an asset with the specified URL is (or would be) downloaded to.
+    // This is stable across differently signed variants of the same Discord CDN URL.
+    public static string GetTargetFileName(string url) => GetFileNameFromUrl(url);
+
+    // Files uploaded by users as message attachments, as opposed to avatars, emoji, stickers,
+    // or images embedded from third-party websites.
+    public static bool IsDiscordAttachmentUrl(string url)
+    {
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
+            return false;
+
+        var isDiscordHost =
+            string.Equals(uri.Host, "cdn.discordapp.com", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(uri.Host, "media.discordapp.net", StringComparison.OrdinalIgnoreCase);
+
+        return isDiscordHost
+            && uri.AbsolutePath.StartsWith("/attachments/", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static string NormalizeUrl(string url)
     {
         // Remove signature parameters from Discord CDN/media URLs to normalize them

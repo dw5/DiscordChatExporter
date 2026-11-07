@@ -235,7 +235,7 @@ public abstract class ExportCommandBase : DiscordCommandBase
 
                 // Remove forums, as they cannot be exported directly and their constituent threads
                 // have already been fetched.
-                unwrappedChannels.RemoveAll(channel => channel.Kind == ChannelKind.GuildForum);
+                unwrappedChannels.RemoveAll(channel => channel.IsThreadContainer);
 
                 await console.Output.WriteLineAsync($"Fetched {fetchedThreadsCount} thread(s).");
             }

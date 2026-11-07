@@ -25,15 +25,20 @@ public class DiscordClient(
     private readonly Uri _baseUri = new("https://discord.com/api/v10/", UriKind.Absolute);
     private TokenKind? _resolvedTokenKind;
 
-    private async ValueTask<HttpResponseMessage> GetResponseAsync(
+    private async ValueTask<HttpResponseMessage> SendAsync(
+        HttpMethod method,
         string url,
+        Func<HttpContent?>? contentFactory,
         TokenKind tokenKind,
         CancellationToken cancellationToken = default
     ) =>
         await Http.ResponseResiliencePipeline.ExecuteAsync(
             async innerCancellationToken =>
             {
-                using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(_baseUri, url));
+                // The request (and its content) must be recreated on every attempt,
+                // because a request message cannot be sent more than once.
+                using var request = new HttpRequestMessage(method, new Uri(_baseUri, url));
+                request.Content = contentFactory?.Invoke();
 
                 // Don't validate because the token can have special characters
                 // https://github.com/Tyrrrz/DiscordChatExporter/issues/828
@@ -90,6 +95,12 @@ public class DiscordClient(
             cancellationToken
         );
 
+    private async ValueTask<HttpResponseMessage> GetResponseAsync(
+        string url,
+        TokenKind tokenKind,
+        CancellationToken cancellationToken = default
+    ) => await SendAsync(HttpMethod.Get, url, null, tokenKind, cancellationToken);
+
     private async ValueTask<TokenKind> ResolveTokenKindAsync(
         CancellationToken cancellationToken = default
     )
@@ -138,39 +149,42 @@ public class DiscordClient(
         using var response = await GetResponseAsync(url, cancellationToken);
 
         if (!response.IsSuccessStatusCode)
-        {
-            throw response.StatusCode switch
-            {
-                HttpStatusCode.Unauthorized => throw new DiscordChatExporterException(
-                    "Authentication token is invalid.",
-                    true
-                ),
-
-                HttpStatusCode.Forbidden => throw new DiscordChatExporterException(
-                    $"Request to '{url}' failed: forbidden."
-                ),
-
-                HttpStatusCode.NotFound => throw new DiscordChatExporterException(
-                    $"Request to '{url}' failed: not found."
-                ),
-
-                _ => throw new DiscordChatExporterException(
-                    $"""
-                    Request to '{url}' failed: {response
-                        .StatusCode.ToString()
-                        .SeparateWords(' ')
-                        .ToLowerInvariant()}.
-                    Response content: {await response.Content.ReadAsStringAsync(
-                        cancellationToken
-                    )}
-                    """,
-                    true
-                ),
-            };
-        }
+            throw await CreateRequestFailedExceptionAsync(url, response, cancellationToken);
 
         return await response.Content.ReadAsJsonAsync(cancellationToken);
     }
+
+    private static async ValueTask<DiscordChatExporterException> CreateRequestFailedExceptionAsync(
+        string url,
+        HttpResponseMessage response,
+        CancellationToken cancellationToken = default
+    ) =>
+        response.StatusCode switch
+        {
+            HttpStatusCode.Unauthorized => new DiscordChatExporterException(
+                "Authentication token is invalid.",
+                true
+            ),
+
+            HttpStatusCode.Forbidden => new DiscordChatExporterException(
+                $"Request to '{url}' failed: forbidden."
+            ),
+
+            HttpStatusCode.NotFound => new DiscordChatExporterException(
+                $"Request to '{url}' failed: not found."
+            ),
+
+            _ => new DiscordChatExporterException(
+                $"""
+                Request to '{url}' failed: {response
+                    .StatusCode.ToString()
+                    .SeparateWords(' ')
+                    .ToLowerInvariant()}.
+                Response content: {await response.Content.ReadAsStringAsync(cancellationToken)}
+                """,
+                true
+            ),
+        };
 
     private async ValueTask<JsonElement?> TryGetJsonResponseAsync(
         string url,
@@ -181,6 +195,51 @@ public class DiscordClient(
         return response.IsSuccessStatusCode
             ? await response.Content.ReadAsJsonAsync(cancellationToken)
             : null;
+    }
+
+    // Same as TryGetJsonResponseAsync, but in strict mode only treats responses that indicate
+    // an inaccessible or inapplicable resource as missing, and throws on everything else
+    // (authentication failures, exhausted rate limit retries, server errors).
+    private async ValueTask<JsonElement?> TryGetJsonResponseAsync(
+        string url,
+        bool strict,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (!strict)
+            return await TryGetJsonResponseAsync(url, cancellationToken);
+
+        using var response = await GetResponseAsync(url, cancellationToken);
+
+        if (response.IsSuccessStatusCode)
+            return await response.Content.ReadAsJsonAsync(cancellationToken);
+
+        if (
+            response.StatusCode
+            is HttpStatusCode.BadRequest
+                or HttpStatusCode.Forbidden
+                or HttpStatusCode.NotFound
+        )
+        {
+            return null;
+        }
+
+        var exception = await CreateRequestFailedExceptionAsync(url, response, cancellationToken);
+
+        // Make sure the failure is not mistaken for a recoverable per-channel error
+        throw exception.IsFatal
+            ? exception
+            : new DiscordChatExporterException(exception.Message, true, exception);
+    }
+
+    public async ValueTask<TokenKind> GetTokenKindAsync(
+        CancellationToken cancellationToken = default
+    ) => await ResolveTokenKindAsync(cancellationToken);
+
+    public async ValueTask<User> GetCurrentUserAsync(CancellationToken cancellationToken = default)
+    {
+        var response = await GetJsonResponseAsync("users/@me", cancellationToken);
+        return User.Parse(response);
     }
 
     public async ValueTask<Application> GetApplicationAsync(
@@ -420,12 +479,32 @@ public class DiscordClient(
         return Channel.Parse(response.Value, parent);
     }
 
-    public async IAsyncEnumerable<Channel> GetChannelThreadsAsync(
+    public IAsyncEnumerable<Channel> GetChannelThreadsAsync(
         IReadOnlyList<Channel> channels,
         bool includeArchived = false,
         Snowflake? before = null,
         Snowflake? after = null,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default
+        CancellationToken cancellationToken = default
+    ) => GetChannelThreadsAsync(channels, includeArchived, before, after, false, cancellationToken);
+
+    // Unlike GetChannelThreadsAsync, this throws instead of silently stopping the enumeration when
+    // a request fails for a reason other than the channel being inaccessible, so that callers can
+    // tell a complete list of threads apart from a truncated one.
+    public IAsyncEnumerable<Channel> GetChannelThreadsStrictAsync(
+        IReadOnlyList<Channel> channels,
+        bool includeArchived = false,
+        Snowflake? before = null,
+        Snowflake? after = null,
+        CancellationToken cancellationToken = default
+    ) => GetChannelThreadsAsync(channels, includeArchived, before, after, true, cancellationToken);
+
+    private async IAsyncEnumerable<Channel> GetChannelThreadsAsync(
+        IReadOnlyList<Channel> channels,
+        bool includeArchived,
+        Snowflake? before,
+        Snowflake? after,
+        bool strict,
+        [EnumeratorCancellation] CancellationToken cancellationToken
     )
     {
         var filteredChannels = channels
@@ -470,7 +549,11 @@ public class DiscordClient(
                             .Build();
 
                         // Can be null on channels that the user cannot access or channels without threads
-                        var response = await TryGetJsonResponseAsync(url, cancellationToken);
+                        var response = await TryGetJsonResponseAsync(
+                            url,
+                            strict,
+                            cancellationToken
+                        );
                         if (response is null)
                             break;
 
@@ -561,7 +644,11 @@ public class DiscordClient(
                                 .Build();
 
                             // Can be null on certain channels
-                            var response = await TryGetJsonResponseAsync(url, cancellationToken);
+                            var response = await TryGetJsonResponseAsync(
+                                url,
+                                strict,
+                                cancellationToken
+                            );
                             if (response is null)
                                 break;
 
@@ -874,5 +961,80 @@ public class DiscordClient(
             if (count <= 0)
                 yield break;
         }
+    }
+
+    public async ValueTask<MessageDeletionResult> DeleteMessageAsync(
+        Snowflake channelId,
+        Snowflake messageId,
+        CancellationToken cancellationToken = default
+    )
+    {
+        var tokenKind = await ResolveTokenKindAsync(cancellationToken);
+
+        using var response = await SendAsync(
+            HttpMethod.Delete,
+            $"channels/{channelId}/messages/{messageId}",
+            null,
+            tokenKind,
+            cancellationToken
+        );
+
+        return await ToDeletionResultAsync(response, cancellationToken);
+    }
+
+    // Only available to bots with the 'Manage Messages' permission.
+    // All messages must be younger than 14 days, and there must be between 2 and 100 of them.
+    public async ValueTask<MessageDeletionResult> BulkDeleteMessagesAsync(
+        Snowflake channelId,
+        IReadOnlyList<Snowflake> messageIds,
+        CancellationToken cancellationToken = default
+    )
+    {
+        if (messageIds.Count is < 2 or > 100)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(messageIds),
+                "Bulk deletion requires between 2 and 100 messages."
+            );
+        }
+
+        var tokenKind = await ResolveTokenKindAsync(cancellationToken);
+        if (tokenKind != TokenKind.Bot)
+        {
+            throw new InvalidOperationException("Bulk deletion is only available to bot accounts.");
+        }
+
+        var payload = JsonSerializer.Serialize(
+            new Dictionary<string, string[]>
+            {
+                ["messages"] = messageIds.Select(id => id.ToString()).ToArray(),
+            }
+        );
+
+        using var response = await SendAsync(
+            HttpMethod.Post,
+            $"channels/{channelId}/messages/bulk-delete",
+            () => new StringContent(payload, System.Text.Encoding.UTF8, "application/json"),
+            tokenKind,
+            cancellationToken
+        );
+
+        return await ToDeletionResultAsync(response, cancellationToken);
+    }
+
+    private static async ValueTask<MessageDeletionResult> ToDeletionResultAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken
+    )
+    {
+        var body = !response.IsSuccessStatusCode
+            ? await response.Content.ReadAsStringAsync(cancellationToken)
+            : null;
+
+        var result = MessageDeletionResult.FromResponse(response.StatusCode, body);
+        if (result.Outcome == MessageDeletionOutcome.Unauthorized)
+            throw new DiscordChatExporterException("Authentication token is invalid.", true);
+
+        return result;
     }
 }

@@ -47,6 +47,11 @@ public partial class ExportRequest
 
     public bool IsUtcNormalizationEnabled { get; }
 
+    // When a Discord-hosted attachment cannot be downloaded, reference the local path where it would
+    // have been saved instead of the remote URL, so that the export links to the file once it's
+    // recovered later. Has no effect unless assets are being downloaded.
+    public bool LinkFailedAttachmentsLocally { get; init; }
+
     public ExportRequest(
         Guild guild,
         Channel channel,

@@ -37,6 +37,10 @@ public partial record Channel(
             or ChannelKind.GuildPublicThread
             or ChannelKind.GuildPrivateThread;
 
+    // Forum and media channels don't have messages of their own, only threads
+    public bool IsThreadContainer { get; } =
+        Kind is ChannelKind.GuildForum or ChannelKind.GuildMedia;
+
     public bool IsEmpty { get; } = LastMessageId is null;
 
     public IEnumerable<Channel> GetParents()

@@ -1,0 +1,33 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <AssemblyName>DiscordChatExporter.Web</AssemblyName>
+    <ApplicationIcon>../favicon.ico</ApplicationIcon>
+    <CopyOutputSymbolsToPublishDirectory>false</CopyOutputSymbolsToPublishDirectory>
+    <!-- The browser UI is compiled into the assembly so that a single-file build is self-sufficient -->
+    <GenerateEmbeddedFilesManifest>true</GenerateEmbeddedFilesManifest>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="ClientApp/**" />
+    <EmbeddedResource
+      Include="../favicon.png"
+      Link="ClientApp/favicon.png"
+      LogicalName="favicon.png"
+    />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="DiscordChatExporter.Web.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CSharpier.MsBuild" PrivateAssets="all" />
+    <PackageReference Include="Microsoft.Data.Sqlite" />
+    <PackageReference Include="Microsoft.Extensions.FileProviders.Embedded" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../DiscordChatExporter.Core/DiscordChatExporter.Core.csproj" />
+  </ItemGroup>
+</Project>
