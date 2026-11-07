@@ -102,9 +102,49 @@ public static class ApiEndpoints
                 {
                     if (guild.Id == Guild.DirectMessages.Id)
                         continue;
-                    guilds.Add(new { id = guild.Id.ToString(), name = guild.Name });
+                    guilds.Add(
+                        new
+                        {
+                            id = guild.Id.ToString(),
+                            name = guild.Name,
+                            icon = guild.IconUrl,
+                        }
+                    );
                 }
                 return Results.Ok(guilds);
+            }
+        );
+
+        app.MapGet(
+            "/api/guilds/{guildId}/channels",
+            async (string guildId, DiscordSession session, CancellationToken ct) =>
+            {
+                var state = session.Current;
+                if (state is null)
+                    return Results.Unauthorized();
+                if (!Snowflake.TryParse(guildId, CultureInfo.InvariantCulture).HasValue)
+                    return Results.BadRequest(new { error = "Invalid server ID." });
+
+                var channels = new List<object>();
+                await foreach (
+                    var channel in state.Client.GetGuildChannelsAsync(Snowflake.Parse(guildId), ct)
+                )
+                {
+                    // Categories are headers, not exportable; threads are pulled in automatically
+                    if (channel.IsCategory)
+                        continue;
+                    channels.Add(
+                        new
+                        {
+                            id = channel.Id.ToString(),
+                            name = channel.Name,
+                            category = channel.Parent?.Name,
+                            isVoice = channel.IsVoice,
+                            isForum = channel.IsThreadContainer,
+                        }
+                    );
+                }
+                return Results.Ok(channels);
             }
         );
     }

@@ -31,10 +31,10 @@ const el = (tag, props = {}, ...children) => {
     if (k === "class") e.className = v;
     else if (k === "html") e.innerHTML = v;
     else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
-    else if (v !== null && v !== undefined) e.setAttribute(k, v);
+    else if (v !== null && v !== undefined && v !== false) e.setAttribute(k, v === true ? "" : v);
   }
   for (const c of children.flat()) {
-    if (c == null) continue;
+    if (c == null || c === false) continue;
     e.append(c.nodeType ? c : document.createTextNode(c));
   }
   return e;
@@ -44,7 +44,6 @@ const root = () => document.getElementById("app");
 const clear = (n) => {
   while (n.firstChild) n.removeChild(n.firstChild);
 };
-const esc = (s) => (s || "").replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" })[c]);
 
 let state = { session: null };
 
@@ -87,8 +86,7 @@ function showSignIn() {
     err.classList.add("hidden");
     btn.disabled = true;
     try {
-      const res = await api.post("/api/session", { token: token.value });
-      state.session = res;
+      state.session = await api.post("/api/session", { token: token.value });
       showDashboard();
     } catch (e) {
       err.textContent = e.message;
@@ -113,35 +111,51 @@ function showSignIn() {
   token.focus();
 }
 
-// ---- dashboard: pick server, export --------------------------------------------------------
+// ---- dashboard: pick server ----------------------------------------------------------------
 
 async function showDashboard() {
   const view = el("div", {});
   render(view);
 
-  const guildCard = el("div", { class: "card" }, el("h2", {}, "Servers"), el("p", { class: "muted" }, "Loading servers…"));
+  const search = el("input", { type: "search", placeholder: "Search servers…" });
+  const listWrap = el("div", {});
+  const guildCard = el("div", { class: "card" }, el("h2", {}, "Choose a server"), search, listWrap);
   const runsCard = el("div", { class: "card" }, el("h2", {}, "Previous exports"), el("p", { class: "muted" }, "Loading…"));
   view.append(guildCard, runsCard);
 
-  try {
-    const guilds = await api.get("/api/guilds");
-    clear(guildCard);
-    guildCard.append(el("h2", {}, "Servers"));
-    if (!guilds.length) guildCard.append(el("p", { class: "muted" }, "No servers found for this account."));
-    for (const g of guilds) {
-      guildCard.append(
+  let guilds = [];
+  const draw = () => {
+    const q = search.value.trim().toLowerCase();
+    const shown = guilds.filter((g) => !q || g.name.toLowerCase().includes(q));
+    clear(listWrap);
+    if (!shown.length) {
+      listWrap.append(el("p", { class: "muted" }, guilds.length ? "No servers match." : "No servers found for this account."));
+      return;
+    }
+    for (const g of shown) {
+      const icon = g.icon
+        ? el("img", { src: g.icon, class: "guild-icon", loading: "lazy" })
+        : el("div", { class: "guild-icon placeholder" }, (g.name[0] || "?").toUpperCase());
+      listWrap.append(
         el(
           "div",
           { class: "list-item", onclick: () => showExportSetup(g) },
+          icon,
           el("strong", {}, g.name),
           el("div", { class: "spacer" }),
-          el("span", { class: "muted" }, g.id),
+          el("span", { class: "muted small" }, g.id),
         ),
       );
     }
+  };
+  search.addEventListener("input", draw);
+
+  try {
+    guilds = await api.get("/api/guilds");
+    draw();
   } catch (e) {
-    clear(guildCard);
-    guildCard.append(el("h2", {}, "Servers"), el("div", { class: "banner danger" }, e.message));
+    clear(listWrap);
+    listWrap.append(el("div", { class: "banner danger" }, e.message));
   }
 
   loadRuns(runsCard);
@@ -160,7 +174,7 @@ async function loadRuns(card) {
           { class: "list-item", onclick: () => showRun(r.runId) },
           el("strong", {}, r.guild || r.runId),
           el("div", { class: "spacer" }),
-          el("span", { class: "muted" }, r.runId),
+          el("span", { class: "muted small" }, r.runId),
         ),
       );
     }
@@ -169,19 +183,68 @@ async function loadRuns(card) {
   }
 }
 
-function showExportSetup(guild) {
+// ---- export setup: what and which channels -------------------------------------------------
+
+async function showExportSetup(guild) {
+  const view = el("div", {});
+  view.append(el("button", { class: "secondary", onclick: showDashboard }, "← Back to servers"));
+  render(view);
+
+  // What to back up
+  const modeEverything = el("input", { type: "radio", name: "mode", value: "all", checked: true });
+  const modeMine = el("input", { type: "radio", name: "mode", value: "mine" });
+
+  // Channel scope
+  const chanAll = el("input", { type: "radio", name: "chans", value: "all", checked: true });
+  const chanPick = el("input", { type: "radio", name: "chans", value: "pick" });
+  const chanListWrap = el("div", { class: "channel-list hidden" }, el("p", { class: "muted" }, "Loading channels…"));
+  const channelChecks = {};
+
+  const loadChannels = async () => {
+    if (Object.keys(channelChecks).length) return;
+    try {
+      const chans = await api.get(`/api/guilds/${guild.id}/channels`);
+      clear(chanListWrap);
+      if (!chans.length) chanListWrap.append(el("p", { class: "muted" }, "No channels."));
+      for (const c of chans) {
+        const cb = el("input", { type: "checkbox", checked: true });
+        channelChecks[c.id] = cb;
+        const label = (c.category ? c.category + " / " : "") + c.name + (c.isForum ? " (forum)" : c.isVoice ? " (voice)" : "");
+        chanListWrap.append(el("div", { class: "check tight" }, cb, el("label", {}, label)));
+      }
+    } catch (e) {
+      clear(chanListWrap);
+      chanListWrap.append(el("div", { class: "banner danger" }, e.message));
+    }
+  };
+  chanPick.addEventListener("change", () => {
+    chanListWrap.classList.remove("hidden");
+    loadChannels();
+  });
+  chanAll.addEventListener("change", () => chanListWrap.classList.add("hidden"));
+
+  // Options
   const threads = el("select", {}, el("option", { value: "all" }, "Active + archived threads"), el("option", { value: "active" }, "Active threads only"), el("option", { value: "none" }, "No threads"));
-  const media = el("input", { type: "checkbox", checked: "" });
-  const voice = el("input", { type: "checkbox", checked: "" });
-  const fmtHtml = el("input", { type: "checkbox", checked: "" });
-  const fmtJson = el("input", { type: "checkbox", checked: "" });
-  const btn = el("button", {}, "Export everything");
+  const media = el("input", { type: "checkbox", checked: true });
+  const voice = el("input", { type: "checkbox", checked: true });
+  const fmtHtml = el("input", { type: "checkbox", checked: true });
+  const fmtJson = el("input", { type: "checkbox", checked: true });
+  const btn = el("button", {}, "Start backup");
 
   btn.addEventListener("click", async () => {
     const formats = [];
-    if (fmtHtml.checked) formats.push(1); // HtmlDark
-    if (fmtJson.checked) formats.push(4); // Json
+    if (fmtHtml.checked) formats.push(1);
+    if (fmtJson.checked) formats.push(4);
     if (!formats.length) formats.push(1);
+
+    const channelIds = chanPick.checked
+      ? Object.entries(channelChecks).filter(([, cb]) => cb.checked).map(([id]) => id)
+      : [];
+    if (chanPick.checked && !channelIds.length) {
+      alert("Select at least one channel, or choose All channels.");
+      return;
+    }
+
     btn.disabled = true;
     try {
       const res = await api.post("/api/exports", {
@@ -191,41 +254,47 @@ function showExportSetup(guild) {
           includeVoiceChannels: voice.checked,
           downloadMedia: media.checked,
           formatMarkdown: true,
+          onlyMyMessages: modeMine.checked,
+          channelIds,
           formats,
         },
       });
-      runJob(res.jobId, "Exporting " + guild.name, (ev) => {
-        if (ev.type === "run" && ev.payload.runId) {
-          window._lastRunId = ev.payload.runId;
-        }
-      }, () => {
-        if (window._lastRunId) showRun(window._lastRunId);
-        else showDashboard();
-      });
+      window._lastRunId = null;
+      runJob(res.jobId, "Backing up " + guild.name, (ev) => {
+        if (ev.type === "run" && ev.payload.runId) window._lastRunId = ev.payload.runId;
+      }, () => (window._lastRunId ? showRun(window._lastRunId) : showDashboard()));
     } catch (e) {
       alert(e.message);
       btn.disabled = false;
     }
   });
 
-  render(
+  view.append(
     el(
       "div",
-      {},
-      el("button", { class: "secondary", onclick: showDashboard }, "← Back"),
-      el(
-        "div",
-        { class: "card" },
-        el("h2", {}, "Export " + guild.name),
-        el("label", {}, "Threads"),
-        threads,
-        el("div", { class: "check" }, voice, el("label", {}, "Include voice channel text")),
-        el("div", { class: "check" }, media, el("label", {}, "Download media (attachments, images)")),
-        el("label", {}, "Formats"),
-        el("div", { class: "check" }, fmtHtml, el("label", {}, "HTML (readable)")),
-        el("div", { class: "check" }, fmtJson, el("label", {}, "JSON (for re-import / analysis)")),
-        el("div", { style: "margin-top:14px" }, btn),
-      ),
+      { class: "card" },
+      el("h2", {}, "Back up " + guild.name),
+      el("p", { class: "muted" }, "A backup is required before anything can be deleted — you can only ever delete messages that were backed up here."),
+
+      el("h3", {}, "What to back up"),
+      el("div", { class: "check" }, modeEverything, el("label", {}, el("strong", {}, "Everything"), el("div", { class: "muted small" }, "All messages from everyone (a full archive)."))),
+      el("div", { class: "check" }, modeMine, el("label", {}, el("strong", {}, "Only messages I sent"), el("div", { class: "muted small" }, `Only ${state.session.user.name}'s messages — lighter, and the usual choice if you just want to clean up after yourself.`))),
+
+      el("h3", {}, "Which channels"),
+      el("div", { class: "check" }, chanAll, el("label", {}, "All channels")),
+      el("div", { class: "check" }, chanPick, el("label", {}, "Choose channels")),
+      chanListWrap,
+
+      el("h3", {}, "Options"),
+      el("label", {}, "Threads"),
+      threads,
+      el("div", { class: "check" }, voice, el("label", {}, "Include voice channel text")),
+      el("div", { class: "check" }, media, el("label", {}, "Download media (attachments, images)")),
+      el("label", {}, "Save as"),
+      el("div", { class: "check" }, fmtHtml, el("label", {}, "HTML (readable)")),
+      el("div", { class: "check" }, fmtJson, el("label", {}, "JSON (for re-import / analysis)")),
+
+      el("div", { style: "margin-top:16px" }, btn),
     ),
   );
 }
@@ -240,13 +309,7 @@ function runJob(jobId, title, onEvent, onDone) {
   const cancelBtn = el("button", { class: "danger" }, "Cancel");
   cancelBtn.addEventListener("click", () => api.post(`/api/jobs/${jobId}/cancel`).catch(() => {}));
 
-  render(
-    el(
-      "div",
-      {},
-      el("div", { class: "card" }, el("h2", {}, title), el("div", { class: "progress" }, bar), status, el("div", { style: "margin:10px 0" }, cancelBtn), log),
-    ),
-  );
+  render(el("div", {}, el("div", { class: "card" }, el("h2", {}, title), el("div", { class: "progress" }, bar), status, el("div", { style: "margin:10px 0" }, cancelBtn), log)));
 
   const es = new EventSource(`/api/jobs/${jobId}/events`);
   const addLog = (m) => {
@@ -267,15 +330,12 @@ function runJob(jobId, title, onEvent, onDone) {
     cancelBtn.classList.add("hidden");
     addLog(`[${d.state}]` + (d.error ? " " + d.error : ""));
     status.textContent = d.state;
-    const next = el("button", { onclick: () => onDone && onDone(d) }, "Continue");
-    status.after(next);
+    status.after(el("button", { onclick: () => onDone && onDone(d) }, "Continue"));
   });
-  es.onerror = () => {
-    // Stream closes normally on done; ignore transient errors
-  };
+  es.onerror = () => {};
 }
 
-// ---- run view: channels, messages, deletion ------------------------------------------------
+// ---- run view: summary, channels, deletion -------------------------------------------------
 
 async function showRun(runId) {
   let data;
@@ -289,7 +349,6 @@ async function showRun(runId) {
   const view = el("div", {});
   view.append(el("button", { class: "secondary", onclick: showDashboard }, "← Back"));
 
-  // Summary
   const completeChannels = data.channels.filter((c) => c.status === "Complete").length;
   const mediaErr = data.channels.filter((c) => c.status === "CompleteMediaErrors").length;
   const totalMsgs = data.channels.reduce((a, c) => a + c.messageCount, 0);
@@ -305,7 +364,7 @@ async function showRun(runId) {
       el("div", {}, el("div", { class: "stat" }, String(completeChannels)), el("div", { class: "muted" }, "channels complete")),
       el("div", {}, el("div", { class: "stat" }, String(mediaErr)), el("div", { class: "muted" }, "with missing media")),
     ),
-    el("p", { class: "muted" }, "Open the backed-up files: ", el("a", { href: `/files/${runId}/`, target: "_blank" }, "browse export folder")),
+    el("p", { class: "muted" }, "Backed-up files: ", el("a", { href: `/files/${runId}/`, target: "_blank" }, "browse export folder")),
   );
   if (mediaErr > 0) {
     const retry = el("button", { class: "secondary" }, "Retry missing media");
@@ -321,43 +380,44 @@ async function showRun(runId) {
   }
   view.append(summary);
 
-  // Channel table
   const chanCard = el("div", { class: "card" }, el("h2", {}, "Channels"));
   const tbl = el("table", {}, el("tr", {}, el("th", {}, "Channel"), el("th", {}, "Messages"), el("th", {}, "Status")));
   for (const c of data.channels) {
     const pillClass = c.status === "Complete" ? "ok" : c.status === "CompleteMediaErrors" ? "warn" : c.status === "Failed" ? "err" : "muted";
-    tbl.append(
-      el(
-        "tr",
-        {},
-        el("td", {}, c.name),
-        el("td", {}, String(c.messageCount)),
-        el("td", {}, el("span", { class: "pill " + pillClass }, c.status + (c.failedAttachmentCount ? ` (${c.failedAttachmentCount})` : ""))),
-      ),
-    );
+    tbl.append(el("tr", {}, el("td", {}, c.name), el("td", {}, String(c.messageCount)), el("td", {}, el("span", { class: "pill " + pillClass }, c.status + (c.failedAttachmentCount ? ` (${c.failedAttachmentCount})` : "")))));
   }
   chanCard.append(tbl);
   view.append(chanCard);
 
-  // Deletion section
   view.append(deletionCard(runId, run, data.channels));
   render(view);
 }
 
 function deletionCard(runId, run, channels) {
-  const scope = el("select", {}, el("option", { value: "Mine" }, "Only my own messages"), el("option", { value: "Everyone" }, "Everyone's messages (needs permission)"));
-  const keepPinned = el("input", { type: "checkbox", checked: "" });
-  const keepAttach = el("input", { type: "checkbox" });
-  const allowMedia = el("input", { type: "checkbox" });
-  const keepContains = el("input", { type: "text", placeholder: "comma-separated phrases to keep" });
-  const excludeMsgs = el("textarea", { placeholder: "message IDs or links to keep, one per line" });
+  const mine = state.session.user;
 
-  const excludeChannelsWrap = el("div", {});
+  const scope = el("select", {}, el("option", { value: "Mine" }, `Only my own messages (${mine.name})`), el("option", { value: "Everyone" }, "Everyone's messages (needs Manage Messages)"));
+
+  // Narrowing (undiscord-style) filters
+  const onlyContains = el("input", { type: "text", placeholder: "only delete if text contains…" });
+  const onlyLink = el("input", { type: "checkbox" });
+  const onlyAttach = el("input", { type: "checkbox" });
+  const afterDate = el("input", { type: "text", placeholder: "after (YYYY-MM-DD or message ID)" });
+  const beforeDate = el("input", { type: "text", placeholder: "before (YYYY-MM-DD or message ID)" });
+
+  // Protect-from-deletion
+  const keepPinned = el("input", { type: "checkbox", checked: true });
+  const keepAttach = el("input", { type: "checkbox" });
+  const keepContains = el("input", { type: "text", placeholder: "comma-separated phrases to protect" });
+  const excludeMsgs = el("textarea", { placeholder: "message IDs or links to protect, one per line" });
+  const allowMedia = el("input", { type: "checkbox" });
+
+  const excludeChannelsWrap = el("div", { class: "channel-list" });
   const channelChecks = {};
   for (const c of channels) {
     const cb = el("input", { type: "checkbox" });
     channelChecks[c.id] = cb;
-    excludeChannelsWrap.append(el("div", { class: "check" }, cb, el("label", {}, c.name)));
+    excludeChannelsWrap.append(el("div", { class: "check tight" }, cb, el("label", {}, c.name)));
   }
 
   const result = el("div", {});
@@ -365,6 +425,11 @@ function deletionCard(runId, run, channels) {
   function criteria() {
     return {
       scope: scope.value,
+      onlyContains: onlyContains.value.trim() || null,
+      onlyWithLink: onlyLink.checked,
+      onlyWithAttachment: onlyAttach.checked,
+      onlyAfter: afterDate.value.trim() || null,
+      onlyBefore: beforeDate.value.trim() || null,
       keepPinned: keepPinned.checked,
       keepWithAttachments: keepAttach.checked,
       allowIncompleteMedia: allowMedia.checked,
@@ -391,19 +456,29 @@ function deletionCard(runId, run, channels) {
     "div",
     { class: "card" },
     el("h2", {}, "Delete messages"),
-    el("div", { class: "banner warn" }, "Deletion is permanent. Only messages that were backed up in this export can be deleted. Preview and dry-run first."),
-    el("label", {}, "Whose messages"),
+    el("div", { class: "banner danger" }, "Deletion is permanent. Only messages backed up in this export can be deleted. Preview and dry-run first."),
+
+    el("h3", {}, "Whose messages to delete"),
     scope,
+
+    el("h3", {}, "Only delete messages that… (optional)"),
+    el("label", {}, "Contain text"),
+    onlyContains,
+    el("div", { class: "check" }, onlyLink, el("label", {}, "Contain a link")),
+    el("div", { class: "check" }, onlyAttach, el("label", {}, "Have an attachment")),
+    el("div", { class: "row" }, el("div", {}, el("label", {}, "Sent after"), afterDate), el("div", {}, el("label", {}, "Sent before"), beforeDate)),
+
+    el("h3", {}, "Protect from deletion"),
     el("div", { class: "check" }, keepPinned, el("label", {}, "Keep pinned messages")),
     el("div", { class: "check" }, keepAttach, el("label", {}, "Keep messages with attachments")),
-    el("div", { class: "check" }, allowMedia, el("label", {}, "Include channels with missing media backups")),
     el("label", {}, "Keep messages containing"),
     keepContains,
-    el("label", {}, "Exclude specific messages"),
+    el("label", {}, "Protect specific messages"),
     excludeMsgs,
-    el("label", {}, "Exclude whole channels"),
-    excludeChannelsWrap,
-    el("div", { style: "margin-top:14px" }, previewBtn),
+    el("details", {}, el("summary", { class: "muted" }, "Exclude whole channels"), excludeChannelsWrap),
+    el("div", { class: "check" }, allowMedia, el("label", {}, "Also include channels with missing media backups")),
+
+    el("div", { style: "margin-top:16px" }, previewBtn),
     result,
   );
 }
@@ -419,30 +494,29 @@ function parseRef(v) {
 function renderPreview(runId, run, p) {
   const wrap = el("div", { style: "margin-top:16px" });
   if (p.accountMismatch) {
-    wrap.append(el("div", { class: "banner danger" }, `The export was made by a different account. You are signed in as ${p.deletingUser.name}; only that account's messages will be touched under "mine".`));
+    wrap.append(el("div", { class: "banner danger" }, `This export was made by a different account. You are signed in as ${p.deletingUser.name}; under "only my own", only that account's messages are affected.`));
   }
 
-  wrap.append(
-    el("div", { class: "stat-row" }, el("div", {}, el("div", { class: "stat" }, String(p.totalCandidates)), el("div", { class: "muted" }, "would be deleted")), el("div", {}, el("div", { class: "stat" }, String(p.totalKept)), el("div", { class: "muted" }, "kept by your rules"))),
-  );
+  wrap.append(el("div", { class: "stat-row" }, el("div", {}, el("div", { class: "stat" }, String(p.totalCandidates)), el("div", { class: "muted" }, "would be deleted")), el("div", {}, el("div", { class: "stat" }, String(p.totalKept)), el("div", { class: "muted" }, "protected by your rules"))));
 
-  const perChan = el("table", {}, el("tr", {}, el("th", {}, "Channel"), el("th", {}, "To delete"), el("th", {}, "Kept")));
+  if (p.totalCandidates === 0) {
+    wrap.append(el("div", { class: "banner warn" }, "Nothing matches — adjust the filters above."));
+    return wrap;
+  }
+
+  const perChan = el("table", {}, el("tr", {}, el("th", {}, "Channel"), el("th", {}, "To delete"), el("th", {}, "Protected")));
   for (const c of p.channels) perChan.append(el("tr", {}, el("td", {}, c.channelName), el("td", {}, String(c.candidateCount)), el("td", {}, String(c.keptCount))));
   wrap.append(perChan);
 
   const confirm = el("input", { type: "text", placeholder: `type "${run.guildName}" to confirm` });
-  const dryRun = el("input", { type: "checkbox", checked: "" });
+  const dryRun = el("input", { type: "checkbox", checked: true });
   const go = el("button", { class: "danger" }, "Delete");
 
   go.addEventListener("click", async () => {
     go.disabled = true;
     try {
-      const res = await api.post(`/api/exports/${runId}/deletions`, {
-        planId: p.planId,
-        confirm: confirm.value,
-        dryRun: dryRun.checked,
-      });
-      runJob(res.jobId, dryRun.checked ? "Dry run" : "Deleting messages", null, () => showRun(runId));
+      const res = await api.post(`/api/exports/${runId}/deletions`, { planId: p.planId, confirm: confirm.value, dryRun: dryRun.checked });
+      runJob(res.jobId, dryRun.checked ? "Dry run (nothing deleted)" : "Deleting messages", null, () => showRun(runId));
     } catch (e) {
       alert(e.message);
       go.disabled = false;
@@ -450,7 +524,7 @@ function renderPreview(runId, run, p) {
   });
 
   wrap.append(
-    el("div", { class: "check" }, dryRun, el("label", {}, "Dry run (count only, delete nothing)")),
+    el("div", { class: "check", style: "margin-top:12px" }, dryRun, el("label", {}, el("strong", {}, "Dry run"), " — count only, delete nothing")),
     el("label", {}, "Confirm server name"),
     confirm,
     el("div", { style: "margin-top:10px" }, go),

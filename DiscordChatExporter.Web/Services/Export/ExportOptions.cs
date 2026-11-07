@@ -16,6 +16,13 @@ public record ExportOptions
 
     public int? ParallelLimit { get; init; }
 
+    // When non-empty, only these channel IDs are exported (plus their threads). Empty = all.
+    public IReadOnlyList<string> ChannelIds { get; init; } = [];
+
+    // When true, only messages sent by the signed-in account are exported (and thus can be deleted).
+    // This is the "back up and remove just my own messages" mode, rather than archiving everything.
+    public bool OnlyMyMessages { get; init; }
+
     public IReadOnlyList<ExportFormat> Formats { get; init; } =
     [ExportFormat.HtmlDark, ExportFormat.Json];
 }

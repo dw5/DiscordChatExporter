@@ -58,6 +58,13 @@ public sealed class GuildExportJob(
                 continue;
             channels.Add(channel);
         }
+
+        // Restrict to the chosen channels, if any (keep thread containers so their threads come too)
+        if (options.ChannelIds.Count > 0)
+        {
+            var wanted = options.ChannelIds.ToHashSet();
+            channels = channels.Where(c => wanted.Contains(c.Id.ToString())).ToList();
+        }
         job.Log($"Found {channels.Count} channel(s).");
 
         // 2. Threads (strict, so a failure is loud rather than a silently short list)
@@ -107,6 +114,14 @@ public sealed class GuildExportJob(
         // 3. Export each channel into all requested formats in one pass
         var parallelLimit = options.ParallelLimit ?? (tokenKind == TokenKind.Bot ? 3 : 1);
         var exporter = new ChannelExporter(discord);
+
+        // "Only my messages" narrows the export (and therefore what can be deleted) to the
+        // signed-in account's own messages, matched by author ID.
+        var messageFilter = options.OnlyMyMessages
+            ? DiscordChatExporter.Core.Exporting.Filtering.MessageFilter.Parse(
+                $"from:{currentUser.Id}"
+            )
+            : DiscordChatExporter.Core.Exporting.Filtering.MessageFilter.Null;
         var completed = 0;
         var total = exportable.Length;
 
@@ -135,7 +150,7 @@ public sealed class GuildExportJob(
                             null,
                             null,
                             DiscordChatExporter.Core.Exporting.Partitioning.PartitionLimit.Null,
-                            DiscordChatExporter.Core.Exporting.Filtering.MessageFilter.Null,
+                            messageFilter,
                             false,
                             options.FormatMarkdown,
                             options.DownloadMedia,

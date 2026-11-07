@@ -236,6 +236,42 @@ public class DeletionPlannerTests
     }
 
     [Fact]
+    public void Only_contains_filter_narrows_candidates()
+    {
+        var plan = Plan(
+            new DeletionCriteria { Scope = DeletionScope.Everyone, OnlyContains = "delete me" },
+            [Channel("c1")],
+            [Message("1", content: "please DELETE ME now"), Message("2", content: "keep this")]
+        );
+
+        plan.CandidateMessageIds.Should().BeEquivalentTo("1");
+    }
+
+    [Fact]
+    public void Only_with_link_filter_narrows_candidates()
+    {
+        var plan = Plan(
+            new DeletionCriteria { Scope = DeletionScope.Everyone, OnlyWithLink = true },
+            [Channel("c1")],
+            [Message("1", content: "see https://example.com"), Message("2", content: "no link")]
+        );
+
+        plan.CandidateMessageIds.Should().BeEquivalentTo("1");
+    }
+
+    [Fact]
+    public void Only_with_attachment_filter_narrows_candidates()
+    {
+        var plan = Plan(
+            new DeletionCriteria { Scope = DeletionScope.Everyone, OnlyWithAttachment = true },
+            [Channel("c1")],
+            [Message("1", attachments: 1), Message("2", attachments: 0)]
+        );
+
+        plan.CandidateMessageIds.Should().BeEquivalentTo("1");
+    }
+
+    [Fact]
     public void Before_boundary_only_deletes_older_messages()
     {
         // Snowflake for 2022-01-01 roughly; use IDs where larger = newer

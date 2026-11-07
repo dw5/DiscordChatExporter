@@ -46,6 +46,13 @@ public record DeletionCriteria
     // The user must opt in explicitly, acknowledging the missing-file count.
     public bool AllowIncompleteMedia { get; init; }
 
+    // Undiscord-style narrowing filters: when set, a message must ALSO match to be deleted.
+    public string? OnlyContains { get; init; }
+
+    public bool OnlyWithLink { get; init; }
+
+    public bool OnlyWithAttachment { get; init; }
+
     public Snowflake? ResolveBefore() => ParseBoundary(OnlyBefore);
 
     public Snowflake? ResolveAfter() => ParseBoundary(OnlyAfter);
@@ -66,7 +73,10 @@ public record DeletionCriteria
             ExcludedMessageIds.OrderBy(x => x, StringComparer.Ordinal).ToArray(),
             OnlyBefore,
             OnlyAfter,
-            AllowIncompleteMedia
+            AllowIncompleteMedia,
+            OnlyContains,
+            OnlyWithLink,
+            OnlyWithAttachment
         );
 
         return JsonSerializer.Serialize(normalized);
@@ -82,8 +92,19 @@ public record DeletionCriteria
         string[] ExcludedMessageIds,
         string? OnlyBefore,
         string? OnlyAfter,
-        bool AllowIncompleteMedia
+        bool AllowIncompleteMedia,
+        string? OnlyContains,
+        bool OnlyWithLink,
+        bool OnlyWithAttachment
     );
+
+    // Lightweight link detection for the "only messages with a link" filter.
+    public static bool ContainsLink(string content) =>
+        !string.IsNullOrEmpty(content)
+        && (
+            content.Contains("http://", StringComparison.OrdinalIgnoreCase)
+            || content.Contains("https://", StringComparison.OrdinalIgnoreCase)
+        );
 
     // Parses either a raw message ID or a Discord message link, returning the message ID.
     // https://discord.com/channels/<guild>/<channel>/<message>

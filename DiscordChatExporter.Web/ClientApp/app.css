@@ -42,6 +42,49 @@ h2 {
   font-size: 16px;
   margin: 0 0 12px;
 }
+h3 {
+  font-size: 14px;
+  margin: 20px 0 6px;
+  color: var(--text);
+  border-top: 1px solid var(--border);
+  padding-top: 14px;
+}
+.small {
+  font-size: 12px;
+}
+.guild-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  object-fit: cover;
+  flex: 0 0 auto;
+}
+.guild-icon.placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 700;
+}
+.channel-list {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin: 6px 0;
+}
+.check.tight {
+  margin: 3px 0;
+}
+.check.tight label {
+  font-size: 13px;
+}
+details summary {
+  cursor: pointer;
+  padding: 6px 0;
+}
 
 header.app-bar {
   display: flex;

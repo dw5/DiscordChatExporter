@@ -21,6 +21,7 @@ public enum MessageSkipReason
     OutOfRange,
     ExplicitlyExcluded,
     NotInScope,
+    DoesNotMatchFilter,
 }
 
 public record ChannelPlanSummary(
@@ -135,6 +136,21 @@ public static class DeletionPlanner
             if (after is not null && messageSnowflake.Value.Value <= after.Value.Value)
                 return MessageSkipReason.OutOfRange;
         }
+
+        // Narrowing filters: when set, the message must also match to be a candidate
+        if (
+            !string.IsNullOrEmpty(criteria.OnlyContains)
+            && !message.Content.Contains(criteria.OnlyContains, StringComparison.OrdinalIgnoreCase)
+        )
+        {
+            return MessageSkipReason.DoesNotMatchFilter;
+        }
+
+        if (criteria.OnlyWithLink && !DeletionCriteria.ContainsLink(message.Content))
+            return MessageSkipReason.DoesNotMatchFilter;
+
+        if (criteria.OnlyWithAttachment && message.AttachmentCount == 0)
+            return MessageSkipReason.DoesNotMatchFilter;
 
         return MessageSkipReason.None;
     }
