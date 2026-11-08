@@ -286,7 +286,9 @@ public sealed class DeletionJob(
     // The statuses the planner also counts as candidates, so preview and execution never disagree:
     // never-tried, a prior soft failure, or a transient skip that can succeed once the cause (a
     // missing permission or an archived thread) is fixed. Deleted/Gone/NotDeletable are terminal.
-    private static bool IsRetryableStatus(MessageDeleteStatus status) =>
+    // Public so the review annotation can label messages with the SAME eligibility execution uses,
+    // instead of re-deriving a near-copy that drifts (e.g. forgetting SkippedNotDeletable is terminal).
+    public static bool IsRetryableStatus(MessageDeleteStatus status) =>
         status
             is MessageDeleteStatus.None
                 or MessageDeleteStatus.Failed

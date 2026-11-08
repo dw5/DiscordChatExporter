@@ -524,15 +524,17 @@ function openMessageBrowser(runId, guildId, channels, opts) {
   let lastGroup = null; // { author, time }
   // Protecting/unprotecting a message bumps the manifest revision, which invalidates any plan the
   // caller previewed. Track it so the preview can re-run instead of submitting a now-stale plan (409).
-  // Track unprotects separately: those are the only edits that can ADD messages to the deletion set
-  // (protecting only ever removes), and an add can leave the total unchanged by replacing another.
   let keepChanged = false;
-  let unprotectedAny = false;
+  // Messages re-included by unprotecting a previously-excluded (non-candidate) message. Kept by id
+  // for the reader's whole lifetime — not on the rendered object — so it survives channel switches
+  // and re-paging, and so the grow warning is precise (a swap that keeps the total unchanged still
+  // shows up as a non-empty set).
+  const reincludedIds = new Set();
 
   const close = () => {
     document.removeEventListener("keydown", onKey);
     overlay.remove();
-    if (opts.onClose) opts.onClose(keepChanged, unprotectedAny);
+    if (opts.onClose) opts.onClose(keepChanged, reincludedIds.size > 0);
   };
   const onKey = (e) => e.key === "Escape" && close();
   closeBtn.addEventListener("click", close);
@@ -683,7 +685,7 @@ function openMessageBrowser(runId, guildId, channels, opts) {
       // may become a candidate once the plan is rebuilt (it depends on the other rules, which only
       // the server knows). Never claim "kept" for it — say so and let the re-preview on close
       // resolve it, so it can't silently flip to "will delete" behind an outdated label.
-      const indeterminate = !gone && !m.keep && !m.willDelete && m.unprotected;
+      const indeterminate = !gone && !m.keep && !m.willDelete && reincludedIds.has(m.id);
       msg.classList.toggle("rev-delete", willDelete);
       msg.classList.toggle("rev-keep", !willDelete && !indeterminate);
       msg.classList.toggle("rev-recheck", indeterminate);
@@ -714,15 +716,16 @@ function openMessageBrowser(runId, guildId, channels, opts) {
       try {
         await api.put(`/api/exports/${runId}/messages/${m.id}/keep`, { keep: next });
         m.keep = next;
-        // Protecting resolves the decision (kept). Unprotecting a non-candidate makes it unknown
-        // until the plan is rebuilt — mark it so applyDecision shows "re-preview to confirm".
-        m.unprotected = !next && !m.willDelete;
+        // Protecting resolves the decision (kept). Unprotecting a message that wasn't a frozen
+        // candidate re-includes it — its real decision is unknown until the plan is rebuilt, so
+        // record it by id (not on this object) for "re-preview to confirm" and the grow warning.
+        if (!next && !m.willDelete) reincludedIds.add(m.id);
+        else reincludedIds.delete(m.id);
         msg.classList.toggle("protected", next);
         shield.classList.toggle("on", next);
         shield.title = next ? "Protected — click to unprotect" : "Protect from deletion";
         keptCount += next ? 1 : -1;
         keepChanged = true;
-        if (!next) unprotectedAny = true;
         updateKeptCounter();
         applyDecision();
       } catch (err) {
@@ -852,13 +855,16 @@ function deletionCard(runId, run, channels) {
   // protections changed, so Delete always acts on a current plan rather than a stale one (409).
   // `unprotected` means the reader re-included at least one message (the only way edits can ADD to
   // the set); we warn on that conservatively, since an add can replace another and leave the total
-  // unchanged — so counting candidates would miss it.
-  async function runPreview(unprotected) {
+  // unchanged — so counting candidates would miss it. `snapshot` pins the criteria: the reader's
+  // auto-refresh rebuilds the SAME plan it showed, never whatever the form was later changed to.
+  async function runPreview(unprotected, snapshot) {
     clear(result);
     previewBtn.disabled = true;
     try {
-      const p = await api.post(`/api/exports/${runId}/deletions/preview`, criteria());
-      result.append(renderPreview(runId, run, channels, p, runPreview, !!unprotected));
+      const c = snapshot || criteria();
+      const p = await api.post(`/api/exports/${runId}/deletions/preview`, c);
+      const rerun = (unp) => runPreview(unp, c);
+      result.append(renderPreview(runId, run, channels, p, rerun, !!unprotected));
     } catch (e) {
       result.append(el("div", { class: "banner danger" }, e.message));
     }

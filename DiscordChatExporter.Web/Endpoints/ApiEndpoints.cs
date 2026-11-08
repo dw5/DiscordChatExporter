@@ -328,13 +328,22 @@ public static class ApiEndpoints
 
                     decide = m =>
                     {
-                        var gone =
-                            m.DeleteStatus
-                            is MessageDeleteStatus.Deleted
-                                or MessageDeleteStatus.Gone;
-                        var willDelete = candidateSet.Contains(m.Id) && !m.Keep && !gone;
-                        if (willDelete || gone)
-                            return (willDelete, null);
+                        // A message is actually deleted iff it's in the plan, isn't now protected,
+                        // and its delete-status is still retryable — the exact predicate execution
+                        // uses. A terminal status (deleted, gone, or not-deletable) is never run.
+                        var retryable = DeletionJob.IsRetryableStatus(m.DeleteStatus);
+                        var willDelete = candidateSet.Contains(m.Id) && !m.Keep && retryable;
+                        if (willDelete)
+                            return (true, null);
+                        if (!retryable)
+                            return (
+                                false,
+                                m.DeleteStatus
+                                    is MessageDeleteStatus.Deleted
+                                        or MessageDeleteStatus.Gone
+                                    ? "already gone"
+                                    : "can’t be deleted"
+                            );
                         var reason = channelsById.TryGetValue(m.ChannelId, out var ch)
                             ? KeptReasonLabel(
                                 DeletionPlanner.Evaluate(
