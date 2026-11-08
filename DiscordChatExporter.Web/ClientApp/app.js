@@ -461,7 +461,12 @@ function messageBrowserCard(runId, guildId, channels) {
   );
 }
 
-function openMessageBrowser(runId, guildId, channels) {
+function openMessageBrowser(runId, guildId, channels, opts) {
+  opts = opts || {};
+  // When opened from a deletion preview, the reader becomes a review surface: every message is
+  // tagged with the exact decision the plan will run, and the shield still protects inline.
+  const planId = opts.planId || null;
+  const reviewMode = !!planId;
   const myId = state.session.user.id;
   const channelName = Object.fromEntries(channels.map((c) => [c.id, c.name]));
 
@@ -659,6 +664,29 @@ function openMessageBrowser(runId, guildId, channels) {
 
     const body = el("div", { class: "dc-body" }, ...bodyKids);
 
+    // In review mode, show (and keep in sync) the plan's decision for this message. A message in
+    // the frozen candidate set is deleted unless it's now protected or already gone — the same
+    // shrink-only rule the server enforces at execution.
+    const decisionBadge = el("span", { class: "dc-decision" });
+    function applyDecision() {
+      if (!reviewMode) return;
+      const gone = m.deleteStatus === "Deleted" || m.deleteStatus === "Gone";
+      const willDelete = !!m.willDelete && !m.keep && !gone;
+      msg.classList.toggle("rev-delete", willDelete);
+      msg.classList.toggle("rev-keep", !willDelete);
+      if (gone) {
+        decisionBadge.textContent = "already gone";
+        decisionBadge.className = "dc-decision gone";
+      } else if (willDelete) {
+        decisionBadge.textContent = "will delete";
+        decisionBadge.className = "dc-decision del";
+      } else {
+        decisionBadge.textContent = m.keep ? "protected" : "kept" + (m.keptReason ? " · " + m.keptReason : "");
+        decisionBadge.className = "dc-decision keep";
+      }
+    }
+    applyDecision();
+
     const shield = el("button", { class: "dc-shield" + (m.keep ? " on" : ""), title: m.keep ? "Protected — click to unprotect" : "Protect from deletion" }, "🛡");
     shield.addEventListener("click", async (e) => {
       e.stopPropagation();
@@ -672,6 +700,7 @@ function openMessageBrowser(runId, guildId, channels) {
         shield.title = next ? "Protected — click to unprotect" : "Protect from deletion";
         keptCount += next ? 1 : -1;
         updateKeptCounter();
+        applyDecision();
       } catch (err) {
         alert(err.message);
       }
@@ -680,7 +709,9 @@ function openMessageBrowser(runId, guildId, channels) {
 
     // Jump to the live message on Discord for context before deciding to keep or delete it.
     const discordUrl = guildId ? `https://discord.com/channels/${guildId}/${m.channelId}/${m.id}` : null;
-    const actions = [shield];
+    const actions = [];
+    if (reviewMode) actions.push(decisionBadge);
+    actions.push(shield);
     if (discordUrl) actions.push(el("a", { class: "dc-open", href: discordUrl, target: "_blank", rel: "noopener noreferrer", title: "Open in Discord" }, "↗"));
 
     msg.append(gutter, body, el("div", { class: "dc-actions" }, ...actions));
@@ -704,6 +735,7 @@ function openMessageBrowser(runId, guildId, channels) {
       if (search.value.trim()) params.set("q", search.value.trim());
       if (onlyMine.checked) params.set("author", myId);
       if (keptOnly.checked) params.set("keep", "true");
+      if (planId) params.set("planId", planId);
       params.set("cursor", cursor);
       const res = await api.get(`/api/exports/${runId}/messages?` + params.toString());
       for (const m of res.items) pane.append(renderMessage(m));
@@ -800,7 +832,7 @@ function deletionCard(runId, run, channels) {
     previewBtn.disabled = true;
     try {
       const p = await api.post(`/api/exports/${runId}/deletions/preview`, criteria());
-      result.append(renderPreview(runId, run, p));
+      result.append(renderPreview(runId, run, channels, p));
     } catch (e) {
       result.append(el("div", { class: "banner danger" }, e.message));
     }
@@ -846,7 +878,7 @@ function parseRef(v) {
   return /^\d+$/.test(v) ? v : null;
 }
 
-function renderPreview(runId, run, p) {
+function renderPreview(runId, run, channels, p) {
   const wrap = el("div", { style: "margin-top:16px" });
   if (p.accountMismatch) {
     wrap.append(el("div", { class: "banner danger" }, `This export was made by a different account. You are signed in as ${p.deletingUser.name}; under "only my own", only that account's messages are affected.`));
@@ -867,31 +899,19 @@ function renderPreview(runId, run, p) {
     return wrap;
   }
 
-  // One row per kept/deleted sample message, with media markers so a text-only preview can't
-  // hide that you're about to delete (or are keeping) a message that carries an image/sticker.
-  function sampleRow(m, kind) {
-    const marks = [];
-    if (m.attachments) marks.push("📎");
-    if (m.stickers) marks.push("🖼");
-    if (m.forwarded) marks.push("➦");
-    return el(
-      "div",
-      { class: "del-sample " + kind },
-      el("span", { class: "del-sample-author", style: `color:${authorColor(m.authorName)}` }, m.authorName),
-      el("span", { class: "del-sample-ts muted small" }, fmtTime(m.timestamp)),
-      el("span", { class: "del-sample-text" }, m.content || el("span", { class: "muted" }, "(no text)")),
-      marks.length ? el("span", { class: "del-sample-media", title: "has media" }, marks.join(" ")) : null,
-      m.reason ? el("span", { class: "pill muted del-sample-reason" }, "kept: " + m.reason) : null,
-    );
-  }
+  // Review the actual messages in the real Discord-style reader — every message tagged with the
+  // plan's decision, with the same inline shield to protect anything before deleting.
+  const review = el("button", {}, `Review these ${p.totalCandidates} messages`);
+  review.addEventListener("click", () => openMessageBrowser(runId, run.guildId, channels, { planId: p.planId }));
+  wrap.append(
+    el("p", { class: "muted small" }, "These messages will be permanently deleted from Discord. Open the reader to see each one tagged “will delete” or “kept”, and protect anything else inline before running."),
+    el("div", { style: "margin:4px 0 10px" }, review),
+  );
 
-  const samplesByChannel = Object.fromEntries((p.samples || []).map((s) => [s.channelId, s]));
-  wrap.append(el("p", { class: "muted small" }, "These messages will be permanently deleted from Discord. Each channel shows a few that will go and a few that are kept (and why). Protect anything else you want to keep in “Browse & protect messages” first."));
-
+  // Per-channel breakdown: where the deletions land, and how many are kept in each.
   const list = el("div", { class: "del-list" });
   const channelsToShow = p.channels.filter((c) => c.candidateCount > 0).sort((a, b) => b.candidateCount - a.candidateCount);
   for (const c of channelsToShow) {
-    const s = samplesByChannel[c.id] || samplesByChannel[c.channelId];
     const head = el(
       "div",
       { class: "del-chan-head" },
@@ -899,17 +919,7 @@ function renderPreview(runId, run, p) {
       el("span", { class: "pill err" }, `${c.candidateCount} to delete`),
       c.keptCount ? el("span", { class: "pill muted" }, `${c.keptCount} kept`) : null,
     );
-    const samples = el("div", { class: "del-samples" });
-    const del = (s && s.deleteSample) || [];
-    const keep = (s && s.keepSample) || [];
-    for (const m of del) samples.append(sampleRow(m, "will-delete"));
-    if (c.candidateCount > del.length) samples.append(el("div", { class: "muted small del-more" }, `…and ${c.candidateCount - del.length} more to delete`));
-    if (keep.length) {
-      samples.append(el("div", { class: "del-kept-head muted small" }, "Kept here:"));
-      for (const m of keep) samples.append(sampleRow(m, "will-keep"));
-      if (c.keptCount > keep.length) samples.append(el("div", { class: "muted small del-more" }, `…and ${c.keptCount - keep.length} more kept`));
-    }
-    list.append(el("div", { class: "del-chan" }, head, samples));
+    list.append(el("div", { class: "del-chan" }, head));
   }
   wrap.append(list);
 

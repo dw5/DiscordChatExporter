@@ -749,25 +749,34 @@ a {
 .del-criteria li {
   margin: 2px 0;
 }
-/* Deleted samples get a faint red edge; kept samples a green one, so the two sets read apart. */
-.del-sample.will-delete {
-  border-left: 2px solid var(--danger, #e5484d);
-  padding-left: 8px;
+/* Review mode in the reader: tint each message by the plan's decision and show a badge. */
+.dc-msg.rev-delete {
+  box-shadow: inset 3px 0 0 var(--danger, #e5484d);
 }
-.del-sample.will-keep {
-  border-left: 2px solid #3a9d5d;
-  padding-left: 8px;
+.dc-msg.rev-keep {
+  box-shadow: inset 3px 0 0 #3a9d5d;
 }
-.del-kept-head {
-  margin-top: 6px;
-  font-weight: 600;
+.dc-decision {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 1px 6px;
+  border-radius: 10px;
+  white-space: nowrap;
+  margin-bottom: 4px;
 }
-.del-sample-media {
-  flex: 0 0 auto;
-  font-size: 12px;
+.dc-decision.del {
+  color: #fff;
+  background: var(--danger, #e5484d);
 }
-.del-sample-reason {
-  flex: 0 0 auto;
+.dc-decision.keep {
+  color: #cfe9d6;
+  background: rgba(58, 157, 93, 0.25);
+}
+.dc-decision.gone {
+  color: var(--muted);
+  background: var(--panel);
 }
 
 @media (max-width: 720px) {

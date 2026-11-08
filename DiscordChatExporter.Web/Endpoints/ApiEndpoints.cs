@@ -286,7 +286,8 @@ public static class ApiEndpoints
                 string? author,
                 string? q,
                 bool? keep,
-                int? cursor
+                int? cursor,
+                string? planId
             ) =>
             {
                 var manifest = registry.OpenManifestForRun(runId);
@@ -302,59 +303,114 @@ public static class ApiEndpoints
                     100
                 );
 
+                // When the reader is opened to review a specific deletion plan, tag each message
+                // with the SAME decision that will run: it's deleted iff it's in the plan's frozen
+                // candidate set AND isn't now protected or already gone (execution only ever shrinks
+                // that set). Otherwise show why it's kept, via the same pure Evaluate the plan used.
+                Func<MessageRecord, (bool WillDelete, string? KeptReason)>? decide = null;
+                if (!string.IsNullOrEmpty(planId) && manifest.GetPlan(planId) is { } planRow)
+                {
+                    var candidateSet = manifest
+                        .GetPlanItemIds(planId)
+                        .ToHashSet(StringComparer.Ordinal);
+                    var planCriteria =
+                        System.Text.Json.JsonSerializer.Deserialize<DeletionCriteria>(
+                            planRow.CriteriaJson
+                        ) ?? new DeletionCriteria();
+                    var channelsById = manifest
+                        .GetChannels()
+                        .ToDictionary(c => c.Id, StringComparer.Ordinal);
+                    var planExcluded = planCriteria.ExcludedMessageIds.ToHashSet(
+                        StringComparer.Ordinal
+                    );
+                    var planBefore = planCriteria.ResolveBefore();
+                    var planAfter = planCriteria.ResolveAfter();
+
+                    decide = m =>
+                    {
+                        var gone =
+                            m.DeleteStatus
+                            is MessageDeleteStatus.Deleted
+                                or MessageDeleteStatus.Gone;
+                        var willDelete = candidateSet.Contains(m.Id) && !m.Keep && !gone;
+                        if (willDelete || gone)
+                            return (willDelete, null);
+                        var reason = channelsById.TryGetValue(m.ChannelId, out var ch)
+                            ? KeptReasonLabel(
+                                DeletionPlanner.Evaluate(
+                                    m,
+                                    ch,
+                                    planCriteria,
+                                    planRow.UserId,
+                                    planExcluded,
+                                    planBefore,
+                                    planAfter
+                                )
+                            )
+                            : null;
+                        return (false, reason);
+                    };
+                }
+
                 return Results.Ok(
                     new
                     {
                         total,
                         nextCursor = next,
-                        items = items.Select(m => new
+                        items = items.Select(m =>
                         {
-                            m.Id,
-                            m.ChannelId,
-                            m.AuthorId,
-                            m.AuthorName,
-                            m.AuthorAvatarUrl,
-                            m.Timestamp,
-                            m.Content,
-                            m.IsPinned,
-                            m.AttachmentCount,
-                            m.EmbedCount,
-                            m.Keep,
-                            deleteStatus = m.DeleteStatus.ToString(),
-                            attachments = (m.Attachments ?? []).Select(a => new
+                            var d = decide?.Invoke(m);
+                            return new
                             {
-                                a.FileName,
-                                a.LocalName,
-                                a.Url,
-                                a.Kind,
-                                a.IsSpoiler,
-                            }),
-                            stickers = (m.Stickers ?? []).Select(s => new
-                            {
-                                s.Name,
-                                s.Url,
-                                s.IsImage,
-                            }),
-                            forwarded = m.Forwarded is null
-                                ? null
-                                : new
+                                m.Id,
+                                m.ChannelId,
+                                m.AuthorId,
+                                m.AuthorName,
+                                m.AuthorAvatarUrl,
+                                m.Timestamp,
+                                m.Content,
+                                m.IsPinned,
+                                m.AttachmentCount,
+                                m.EmbedCount,
+                                m.Keep,
+                                deleteStatus = m.DeleteStatus.ToString(),
+                                attachments = (m.Attachments ?? []).Select(a => new
                                 {
-                                    m.Forwarded.Content,
-                                    stickers = m.Forwarded.Stickers.Select(s => new
+                                    a.FileName,
+                                    a.LocalName,
+                                    a.Url,
+                                    a.Kind,
+                                    a.IsSpoiler,
+                                }),
+                                stickers = (m.Stickers ?? []).Select(s => new
+                                {
+                                    s.Name,
+                                    s.Url,
+                                    s.IsImage,
+                                }),
+                                forwarded = m.Forwarded is null
+                                    ? null
+                                    : new
                                     {
-                                        s.Name,
-                                        s.Url,
-                                        s.IsImage,
-                                    }),
-                                    attachments = m.Forwarded.Attachments.Select(a => new
-                                    {
-                                        a.FileName,
-                                        a.LocalName,
-                                        a.Url,
-                                        a.Kind,
-                                        a.IsSpoiler,
-                                    }),
-                                },
+                                        m.Forwarded.Content,
+                                        stickers = m.Forwarded.Stickers.Select(s => new
+                                        {
+                                            s.Name,
+                                            s.Url,
+                                            s.IsImage,
+                                        }),
+                                        attachments = m.Forwarded.Attachments.Select(a => new
+                                        {
+                                            a.FileName,
+                                            a.LocalName,
+                                            a.Url,
+                                            a.Kind,
+                                            a.IsSpoiler,
+                                        }),
+                                    },
+                                willDelete = d?.WillDelete,
+                                keptReason = d?.KeptReason,
+                            };
                         }),
                     }
                 );
@@ -455,76 +511,9 @@ public static class ApiEndpoints
                 );
                 await manifest.FlushAsync();
 
-                // Per-channel samples for the UI: a few messages that WILL be deleted, and a few
-                // that are kept, each kept one tagged with the exact rule that spared it — so the
-                // preview shows not just what goes but why things stay, re-running the same pure
-                // Evaluate the plan used (no second source of truth).
-                var channelNames = channels.ToDictionary(
-                    c => c.Id,
-                    c => c.HierarchicalName,
-                    StringComparer.Ordinal
-                );
-                var channelsById = channels.ToDictionary(c => c.Id, StringComparer.Ordinal);
-                var excludedMsgIds = criteria.ExcludedMessageIds.ToHashSet(StringComparer.Ordinal);
-                var before = criteria.ResolveBefore();
-                var after = criteria.ResolveAfter();
-
-                object SampleOf(MessageRecord m, string? reason) =>
-                    new
-                    {
-                        m.AuthorName,
-                        m.Timestamp,
-                        content = Preview(m.Content),
-                        reason,
-                        attachments = m.AttachmentCount,
-                        stickers = m.Stickers?.Count ?? 0,
-                        forwarded = m.Forwarded is not null,
-                    };
-
-                var samples = messages
-                    .GroupBy(m => m.ChannelId, StringComparer.Ordinal)
-                    .Select(g =>
-                    {
-                        channelsById.TryGetValue(g.Key, out var ch);
-                        var del = new List<object>();
-                        var keep = new List<object>();
-                        foreach (var m in g)
-                        {
-                            if (ch is null)
-                                continue;
-                            if (del.Count >= 4 && keep.Count >= 4)
-                                break;
-
-                            var reason = DeletionPlanner.Evaluate(
-                                m,
-                                ch,
-                                criteria,
-                                deletingUserId,
-                                excludedMsgIds,
-                                before,
-                                after
-                            );
-                            if (reason == MessageSkipReason.None)
-                            {
-                                if (del.Count < 4)
-                                    del.Add(SampleOf(m, null));
-                            }
-                            else if (KeptReasonLabel(reason) is { } label && keep.Count < 4)
-                            {
-                                keep.Add(SampleOf(m, label));
-                            }
-                        }
-                        return new
-                        {
-                            channelId = g.Key,
-                            channelName = channelNames.GetValueOrDefault(g.Key, g.Key),
-                            deleteSample = del,
-                            keepSample = keep,
-                        };
-                    })
-                    .Where(x => x.deleteSample.Count > 0 || x.keepSample.Count > 0)
-                    .ToArray();
-
+                // Samples live in the full message reader now: the UI opens it with this planId and
+                // the messages endpoint tags every message with the same decision that will run, so
+                // the preview itself only needs counts, the per-channel breakdown and the rule recap.
                 var run = manifest.GetRun();
                 var mismatch = run is not null && run.MeUserId != deletingUserId;
                 var confirmText = mismatch
@@ -538,7 +527,6 @@ public static class ApiEndpoints
                         totalCandidates = plan.TotalCandidates,
                         totalKept = plan.TotalKept,
                         channels = plan.ChannelSummaries,
-                        samples,
                         criteriaSummary = DescribeCriteria(criteria, state.User.Name),
                         deletingUser = Describe(state.User),
                         exportingUserId = run?.MeUserId,
@@ -709,15 +697,6 @@ public static class ApiEndpoints
                 }
             }
         );
-    }
-
-    // A short, single-line snippet of a message's text for preview samples.
-    private static string Preview(string? content)
-    {
-        if (string.IsNullOrWhiteSpace(content))
-            return "";
-        var flat = content.ReplaceLineEndings(" ").Trim();
-        return flat.Length <= 140 ? flat : flat[..140] + "…";
     }
 
     private static object Describe(User user) =>
