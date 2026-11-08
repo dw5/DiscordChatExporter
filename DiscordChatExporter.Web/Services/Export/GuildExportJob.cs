@@ -153,6 +153,9 @@ public sealed class GuildExportJob(
                 // Maps each attachment URL to the message it belongs to, so that if its download
                 // fails we can later re-fetch that message for a fresh (re-signed) URL.
                 var attachmentMessageByUrl = new Dictionary<string, string>(StringComparer.Ordinal);
+                // The per-format output files for this channel, so an export that turns out to hold
+                // no messages (e.g. "only my messages" matched nothing here) can delete them again.
+                var outputPaths = System.Array.Empty<string>();
                 try
                 {
                     var requests = options
@@ -181,6 +184,7 @@ public sealed class GuildExportJob(
                             StrictMessageDiscovery = true,
                         })
                         .ToArray();
+                    outputPaths = requests.Select(r => r.OutputFilePath).ToArray();
 
                     var messageCount = 0L;
                     var result = await exporter.ExportChannelAsync(
@@ -219,21 +223,42 @@ public sealed class GuildExportJob(
                         ExportAssetDownloader.IsDiscordAttachmentUrl
                     );
 
-                    var status =
-                        failedAttachments > 0
-                            ? ChannelExportStatus.CompleteMediaErrors
-                            : ChannelExportStatus.Complete;
+                    if (messageCount == 0)
+                    {
+                        // The crawl ran fine but produced no messages for this channel — typically
+                        // "only my messages" matching nothing here. Discard the empty HTML/JSON the
+                        // exporter created so the export only contains channels with real content, and
+                        // record it Empty so backup-gated deletion skips it (there is nothing of ours
+                        // to delete). A channel that is genuinely empty throws ChannelEmptyException
+                        // and is handled the same way below.
+                        DeleteOutputs(outputPaths);
+                        await manifest.SetChannelStatusAsync(
+                            channelId,
+                            ChannelExportStatus.Empty,
+                            0,
+                            null,
+                            0
+                        );
+                    }
+                    else
+                    {
+                        var status =
+                            failedAttachments > 0
+                                ? ChannelExportStatus.CompleteMediaErrors
+                                : ChannelExportStatus.Complete;
 
-                    await manifest.SetChannelStatusAsync(
-                        channelId,
-                        status,
-                        messageCount,
-                        null,
-                        failedAttachments
-                    );
+                        await manifest.SetChannelStatusAsync(
+                            channelId,
+                            status,
+                            messageCount,
+                            null,
+                            failedAttachments
+                        );
+                    }
                 }
                 catch (ChannelEmptyException)
                 {
+                    DeleteOutputs(outputPaths);
                     await manifest.SetChannelStatusAsync(
                         channelId,
                         ChannelExportStatus.Empty,
@@ -326,6 +351,24 @@ public sealed class GuildExportJob(
         catch (Exception ex)
         {
             job.Log("Could not write summary.json: " + ex.Message);
+        }
+    }
+
+    // Best-effort removal of a channel's output files when it exported no messages, so empty
+    // channels don't bloat the export. A failure to delete never fails the export.
+    private static void DeleteOutputs(IEnumerable<string> paths)
+    {
+        foreach (var path in paths)
+        {
+            try
+            {
+                if (File.Exists(path))
+                    File.Delete(path);
+            }
+            catch
+            {
+                // Leaving a stray empty file behind is harmless; never fail the export over it.
+            }
         }
     }
 
