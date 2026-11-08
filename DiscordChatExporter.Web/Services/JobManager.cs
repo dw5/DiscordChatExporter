@@ -254,8 +254,9 @@ public sealed class JobManager
                 return null;
             // A deletion must not be admitted while a protection for the same run is still
             // committing, or it could dispatch a DELETE for a message that is about to be protected
-            // (its keep write hasn't landed yet). canStart re-validates the plan revision inside this
-            // same lock, so once admitted no keep change for the run can have slipped in unseen.
+            // (its keep write hasn't landed yet). The caller's canStart runs below, still under this
+            // lock, so a deletion caller re-validates the plan revision here — atomically with this
+            // pending-keep check — and once admitted no keep change for the run can have slipped in.
             if (
                 kind == JobKind.Deletion
                 && runId is not null

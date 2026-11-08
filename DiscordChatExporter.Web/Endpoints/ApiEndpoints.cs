@@ -642,6 +642,12 @@ public static class ApiEndpoints
                     );
                 }
 
+                // The outer checks above are a fast, specific early-out. The authoritative check runs
+                // inside canStart, which JobManager evaluates under its admission lock AFTER confirming
+                // no protection change for this run is in flight — so a keep mutation that committed
+                // (bumping the revision) between the early-out and admission is caught here and the
+                // run is refused, instead of a stale plan starting.
+                string? admitError = null;
                 var job = jobs.TryStart(
                     JobKind.Deletion,
                     runId,
@@ -657,12 +663,38 @@ public static class ApiEndpoints
                         );
                         await deletionJob.RunAsync(j, ct);
                     },
-                    () => ReferenceEquals(session.Current, state)
+                    () =>
+                    {
+                        if (!ReferenceEquals(session.Current, state))
+                        {
+                            admitError = "The session changed; please sign in and preview again.";
+                            return false;
+                        }
+                        var livePlan = manifest.GetPlan(body.PlanId);
+                        if (
+                            livePlan is null
+                            || livePlan.UserId != deletingUserId
+                            || livePlan.TokenKind != state.TokenKind.ToString()
+                            || livePlan.ManifestRevision != manifest.GetManifestRevision()
+                            || DateTimeOffset.UtcNow - livePlan.CreatedAt > TimeSpan.FromHours(1)
+                        )
+                        {
+                            admitError = "The export or options changed; please preview again.";
+                            return false;
+                        }
+                        return true;
+                    }
                 );
 
-                return job is null
-                    ? Results.Conflict(new { error = "A job is already running." })
-                    : Results.Ok(new { jobId = job.Id });
+                return job is not null
+                    ? Results.Ok(new { jobId = job.Id })
+                    : Results.Conflict(
+                        new
+                        {
+                            error = admitError
+                                ?? "A job or protection change is in progress; please try again.",
+                        }
+                    );
             }
         );
     }

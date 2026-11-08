@@ -51,4 +51,45 @@ public class JobManagerTests
 
         jobs.TryStart(JobKind.Deletion, "r", (_, _) => Task.CompletedTask).Should().NotBeNull();
     }
+
+    [Fact]
+    public void A_pending_keep_change_blocks_admission_before_canStart_is_consulted()
+    {
+        var jobs = new JobManager();
+        jobs.TryBeginKeepChange("r").Should().BeTrue();
+
+        var canStartCalls = 0;
+        var job = jobs.TryStart(
+            JobKind.Deletion,
+            "r",
+            (_, _) => Task.CompletedTask,
+            () =>
+            {
+                canStartCalls++;
+                return true;
+            }
+        );
+
+        job.Should().BeNull();
+        // The pending protection must block admission BEFORE canStart runs, so canStart's plan
+        // re-validation can assume no keep change is mid-commit for the run.
+        canStartCalls.Should().Be(0);
+        jobs.EndKeepChange("r");
+    }
+
+    [Fact]
+    public void Admission_fails_when_canStart_rejects_the_now_stale_plan()
+    {
+        var jobs = new JobManager();
+
+        // Stands in for the endpoint's in-lock re-validation finding the revision changed (e.g. a
+        // keep commit landed between the pre-check and admission): canStart returns false.
+        var job = jobs.TryStart(JobKind.Deletion, "r", (_, _) => Task.CompletedTask, () => false);
+
+        job.Should().BeNull();
+        // And a fresh admission with a valid guard still succeeds afterwards.
+        jobs.TryStart(JobKind.Deletion, "r", (_, _) => Task.CompletedTask, () => true)
+            .Should()
+            .NotBeNull();
+    }
 }
