@@ -522,10 +522,14 @@ function openMessageBrowser(runId, guildId, channels, opts) {
 
   let cursor = 0;
   let lastGroup = null; // { author, time }
+  // Protecting/unprotecting a message bumps the manifest revision, which invalidates any plan the
+  // caller previewed. Track it so the preview can re-run instead of submitting a now-stale plan (409).
+  let keepChanged = false;
 
   const close = () => {
     document.removeEventListener("keydown", onKey);
     overlay.remove();
+    if (opts.onClose) opts.onClose(keepChanged);
   };
   const onKey = (e) => e.key === "Escape" && close();
   closeBtn.addEventListener("click", close);
@@ -686,6 +690,9 @@ function openMessageBrowser(runId, guildId, channels, opts) {
       }
     }
     applyDecision();
+    // The badge must live in the always-visible body, not the .dc-actions column (which is
+    // opacity:0 until hover) — otherwise the review decision is invisible to non-hovering/touch users.
+    if (reviewMode) body.insertBefore(decisionBadge, body.firstChild);
 
     const shield = el("button", { class: "dc-shield" + (m.keep ? " on" : ""), title: m.keep ? "Protected — click to unprotect" : "Protect from deletion" }, "🛡");
     shield.addEventListener("click", async (e) => {
@@ -699,6 +706,7 @@ function openMessageBrowser(runId, guildId, channels, opts) {
         shield.classList.toggle("on", next);
         shield.title = next ? "Protected — click to unprotect" : "Protect from deletion";
         keptCount += next ? 1 : -1;
+        keepChanged = true;
         updateKeptCounter();
         applyDecision();
       } catch (err) {
@@ -709,9 +717,7 @@ function openMessageBrowser(runId, guildId, channels, opts) {
 
     // Jump to the live message on Discord for context before deciding to keep or delete it.
     const discordUrl = guildId ? `https://discord.com/channels/${guildId}/${m.channelId}/${m.id}` : null;
-    const actions = [];
-    if (reviewMode) actions.push(decisionBadge);
-    actions.push(shield);
+    const actions = [shield];
     if (discordUrl) actions.push(el("a", { class: "dc-open", href: discordUrl, target: "_blank", rel: "noopener noreferrer", title: "Open in Discord" }, "↗"));
 
     msg.append(gutter, body, el("div", { class: "dc-actions" }, ...actions));
@@ -826,18 +832,22 @@ function deletionCard(runId, run, channels) {
     };
   }
 
-  const previewBtn = el("button", {}, "Preview deletion");
-  previewBtn.addEventListener("click", async () => {
+  // One place that (re)builds the plan and renders it. The reader calls this again when inline
+  // protections changed, so Delete always acts on a current plan rather than a stale one (409).
+  async function runPreview() {
     clear(result);
     previewBtn.disabled = true;
     try {
       const p = await api.post(`/api/exports/${runId}/deletions/preview`, criteria());
-      result.append(renderPreview(runId, run, channels, p));
+      result.append(renderPreview(runId, run, channels, p, runPreview));
     } catch (e) {
       result.append(el("div", { class: "banner danger" }, e.message));
     }
     previewBtn.disabled = false;
-  });
+  }
+
+  const previewBtn = el("button", {}, "Preview deletion");
+  previewBtn.addEventListener("click", runPreview);
 
   return el(
     "div",
@@ -878,7 +888,7 @@ function parseRef(v) {
   return /^\d+$/.test(v) ? v : null;
 }
 
-function renderPreview(runId, run, channels, p) {
+function renderPreview(runId, run, channels, p, rerun) {
   const wrap = el("div", { style: "margin-top:16px" });
   if (p.accountMismatch) {
     wrap.append(el("div", { class: "banner danger" }, `This export was made by a different account. You are signed in as ${p.deletingUser.name}; under "only my own", only that account's messages are affected.`));
@@ -902,7 +912,16 @@ function renderPreview(runId, run, channels, p) {
   // Review the actual messages in the real Discord-style reader — every message tagged with the
   // plan's decision, with the same inline shield to protect anything before deleting.
   const review = el("button", {}, `Review these ${p.totalCandidates} messages`);
-  review.addEventListener("click", () => openMessageBrowser(runId, run.guildId, channels, { planId: p.planId }));
+  review.addEventListener("click", () =>
+    openMessageBrowser(runId, run.guildId, channels, {
+      planId: p.planId,
+      // Protecting a message in the reader invalidates this plan (revision bump). Re-preview on
+      // close so the counts, rules and Delete button reflect the new protections instead of 409ing.
+      onClose: (changed) => {
+        if (changed && rerun) rerun();
+      },
+    }),
+  );
   wrap.append(
     el("p", { class: "muted small" }, "These messages will be permanently deleted from Discord. Open the reader to see each one tagged “will delete” or “kept”, and protect anything else inline before running."),
     el("div", { style: "margin:4px 0 10px" }, review),
