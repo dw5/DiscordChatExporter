@@ -166,6 +166,12 @@ public sealed class JobManager
     // cannot start mid-change and a change cannot start mid-job: together with the running-job
     // check this keeps every job bound to one account for its whole lifetime.
     private bool _sessionChanging;
+
+    // Count of in-flight protection (keep) mutations per run. Held across the async SetKeep/flush so
+    // that a deletion cannot be admitted while a protection for the same run is committing, and a
+    // protection cannot begin once that run's deletion is running. This makes "protected is never
+    // deleted" hold even against Core's 429 DELETE-retry, which never re-reads keep.
+    private readonly Dictionary<string, int> _pendingKeepByRun = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, Job> _jobs = new();
 
     public Job? Current
@@ -200,6 +206,36 @@ public sealed class JobManager
             _sessionChanging = false;
     }
 
+    // Reserves the right to change protection on a run. Fails if that run's deletion is running, so a
+    // protection can never commit after its message may have been dispatched. The caller pairs a true
+    // result with EndKeepChange() in a finally. While the reservation is held, TryStart refuses to
+    // admit a deletion for the same run, so the two can never interleave.
+    public bool TryBeginKeepChange(string runId)
+    {
+        lock (_lock)
+        {
+            if (
+                _current is { State: JobState.Running, Kind: JobKind.Deletion } d
+                && d.RunId == runId
+            )
+                return false;
+            _pendingKeepByRun[runId] = _pendingKeepByRun.GetValueOrDefault(runId) + 1;
+            return true;
+        }
+    }
+
+    public void EndKeepChange(string runId)
+    {
+        lock (_lock)
+        {
+            var n = _pendingKeepByRun.GetValueOrDefault(runId) - 1;
+            if (n <= 0)
+                _pendingKeepByRun.Remove(runId);
+            else
+                _pendingKeepByRun[runId] = n;
+        }
+    }
+
     // Starts a job unless one is already running or the session is being changed. `canStart`, when
     // given, is evaluated under the admission lock so the caller can confirm the account it captured
     // is still the current one — closing the window between reading the session and admitting the
@@ -215,6 +251,16 @@ public sealed class JobManager
         lock (_lock)
         {
             if (_sessionChanging || _current is { State: JobState.Running })
+                return null;
+            // A deletion must not be admitted while a protection for the same run is still
+            // committing, or it could dispatch a DELETE for a message that is about to be protected
+            // (its keep write hasn't landed yet). canStart re-validates the plan revision inside this
+            // same lock, so once admitted no keep change for the run can have slipped in unseen.
+            if (
+                kind == JobKind.Deletion
+                && runId is not null
+                && _pendingKeepByRun.GetValueOrDefault(runId) > 0
+            )
                 return null;
             if (canStart is not null && !canStart())
                 return null;

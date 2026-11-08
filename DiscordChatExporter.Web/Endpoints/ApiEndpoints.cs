@@ -436,16 +436,14 @@ public static class ApiEndpoints
                 RunRegistry registry
             ) =>
             {
-                // While a deletion for this run is live, a message may already be dispatched, and
-                // Core's HTTP layer retries a 429'd DELETE without re-reading keep — so a protection
-                // committed now could lose the race and the message be deleted anyway. Refuse
-                // protection changes until the deletion finishes or is cancelled, which removes the
-                // window entirely (protection set before the run is still honoured pre-dispatch).
-                if (
-                    jobs.Current
-                        is { State: JobState.Running, Kind: JobKind.Deletion, RunId: var rid }
-                    && rid == runId
-                )
+                // Reserve the right to change protection for this run. The reservation fails if the
+                // run's deletion is running, and while it is held a deletion for the run cannot be
+                // admitted — so the check and the keep commit are atomic with deletion admission, not
+                // a separate check-then-act. This closes the window where a DELETE already dispatched
+                // (and retried by Core's 429 pipeline, which never re-reads keep) could delete a
+                // message whose protection was accepted. Protection set before the run is still
+                // honoured (IsStillDeletable skips it pre-dispatch).
+                if (!jobs.TryBeginKeepChange(runId))
                 {
                     return Results.Conflict(
                         new
@@ -455,13 +453,20 @@ public static class ApiEndpoints
                     );
                 }
 
-                var manifest = registry.OpenManifestForRun(runId);
-                if (manifest is null)
-                    return Results.NotFound();
+                try
+                {
+                    var manifest = registry.OpenManifestForRun(runId);
+                    if (manifest is null)
+                        return Results.NotFound();
 
-                await manifest.SetKeepAsync(messageId, body.Keep);
-                await manifest.FlushAsync();
-                return Results.Ok();
+                    await manifest.SetKeepAsync(messageId, body.Keep);
+                    await manifest.FlushAsync();
+                    return Results.Ok();
+                }
+                finally
+                {
+                    jobs.EndKeepChange(runId);
+                }
             }
         );
 
