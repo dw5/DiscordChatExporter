@@ -455,31 +455,74 @@ public static class ApiEndpoints
                 );
                 await manifest.FlushAsync();
 
-                // A short sample of what will actually be deleted, per channel, for the UI.
-                var candidateSet = plan.CandidateMessageIds.ToHashSet(StringComparer.Ordinal);
+                // Per-channel samples for the UI: a few messages that WILL be deleted, and a few
+                // that are kept, each kept one tagged with the exact rule that spared it — so the
+                // preview shows not just what goes but why things stay, re-running the same pure
+                // Evaluate the plan used (no second source of truth).
                 var channelNames = channels.ToDictionary(
                     c => c.Id,
                     c => c.HierarchicalName,
                     StringComparer.Ordinal
                 );
-                var samples = messages
-                    .Where(m => candidateSet.Contains(m.Id))
-                    .GroupBy(m => m.ChannelId, StringComparer.Ordinal)
-                    .Select(g => new
+                var channelsById = channels.ToDictionary(c => c.Id, StringComparer.Ordinal);
+                var excludedMsgIds = criteria.ExcludedMessageIds.ToHashSet(StringComparer.Ordinal);
+                var before = criteria.ResolveBefore();
+                var after = criteria.ResolveAfter();
+
+                object SampleOf(MessageRecord m, string? reason) =>
+                    new
                     {
-                        channelId = g.Key,
-                        channelName = channelNames.GetValueOrDefault(g.Key, g.Key),
-                        count = g.Count(),
-                        sample = g.Take(4)
-                            .Select(m => new
+                        m.AuthorName,
+                        m.Timestamp,
+                        content = Preview(m.Content),
+                        reason,
+                        attachments = m.AttachmentCount,
+                        stickers = m.Stickers?.Count ?? 0,
+                        forwarded = m.Forwarded is not null,
+                    };
+
+                var samples = messages
+                    .GroupBy(m => m.ChannelId, StringComparer.Ordinal)
+                    .Select(g =>
+                    {
+                        channelsById.TryGetValue(g.Key, out var ch);
+                        var del = new List<object>();
+                        var keep = new List<object>();
+                        foreach (var m in g)
+                        {
+                            if (ch is null)
+                                continue;
+                            if (del.Count >= 4 && keep.Count >= 4)
+                                break;
+
+                            var reason = DeletionPlanner.Evaluate(
+                                m,
+                                ch,
+                                criteria,
+                                deletingUserId,
+                                excludedMsgIds,
+                                before,
+                                after
+                            );
+                            if (reason == MessageSkipReason.None)
                             {
-                                m.AuthorName,
-                                m.Timestamp,
-                                content = Preview(m.Content),
-                            })
-                            .ToArray(),
+                                if (del.Count < 4)
+                                    del.Add(SampleOf(m, null));
+                            }
+                            else if (KeptReasonLabel(reason) is { } label && keep.Count < 4)
+                            {
+                                keep.Add(SampleOf(m, label));
+                            }
+                        }
+                        return new
+                        {
+                            channelId = g.Key,
+                            channelName = channelNames.GetValueOrDefault(g.Key, g.Key),
+                            deleteSample = del,
+                            keepSample = keep,
+                        };
                     })
-                    .OrderByDescending(x => x.count)
+                    .Where(x => x.deleteSample.Count > 0 || x.keepSample.Count > 0)
                     .ToArray();
 
                 var run = manifest.GetRun();
@@ -496,6 +539,7 @@ public static class ApiEndpoints
                         totalKept = plan.TotalKept,
                         channels = plan.ChannelSummaries,
                         samples,
+                        criteriaSummary = DescribeCriteria(criteria, state.User.Name),
                         deletingUser = Describe(state.User),
                         exportingUserId = run?.MeUserId,
                         accountMismatch = mismatch,
@@ -684,6 +728,67 @@ public static class ApiEndpoints
             displayName = user.DisplayName,
             isBot = user.IsBot,
         };
+
+    // The short, human label shown next to a kept sample message explaining why it survives. Only
+    // the "could have been deleted but a rule/choice spared it" reasons get a label; structural
+    // exclusions (wrong author, channel not exported, non-deletable kind) aren't shown as "kept".
+    private static string? KeptReasonLabel(MessageSkipReason reason) =>
+        reason switch
+        {
+            MessageSkipReason.ManuallyKept => "protected",
+            MessageSkipReason.Pinned => "pinned",
+            MessageSkipReason.HasAttachments => "has attachment",
+            MessageSkipReason.ContainsKeepPhrase => "keep-word",
+            MessageSkipReason.ExplicitlyExcluded => "excluded",
+            MessageSkipReason.OutOfRange => "outside date range",
+            _ => null,
+        };
+
+    // Plain-English recap of exactly the (normalized) criteria the server is about to act on, so the
+    // confirm screen restates the rule set rather than making the user trust the form above.
+    private static IReadOnlyList<string> DescribeCriteria(
+        DeletionCriteria c,
+        string deletingUserName
+    )
+    {
+        var lines = new List<string>
+        {
+            c.Scope switch
+            {
+                DeletionScope.Mine => $"Only your own messages ({deletingUserName})",
+                DeletionScope.Everyone => "Everyone's messages (needs Manage Messages)",
+                DeletionScope.Authors => $"Messages by {c.AuthorIds.Count} selected author(s)",
+                _ => "—",
+            },
+        };
+
+        if (c.KeepPinned)
+            lines.Add("Keeping pinned messages");
+        if (c.KeepWithAttachments)
+            lines.Add("Keeping messages that have attachments");
+        if (c.KeepIfContains.Count > 0)
+            lines.Add("Keeping messages containing: " + string.Join(", ", c.KeepIfContains));
+        if (!string.IsNullOrWhiteSpace(c.OnlyAfter))
+            lines.Add($"Only messages after {c.OnlyAfter}");
+        if (!string.IsNullOrWhiteSpace(c.OnlyBefore))
+            lines.Add($"Only messages before {c.OnlyBefore}");
+        if (!string.IsNullOrWhiteSpace(c.OnlyContains))
+            lines.Add($"Only messages containing \"{c.OnlyContains}\"");
+        if (c.OnlyWithLink)
+            lines.Add("Only messages that contain a link");
+        if (c.OnlyWithAttachment)
+            lines.Add("Only messages that have an attachment");
+        if (c.ExcludedChannelIds.Count > 0)
+            lines.Add($"Excluding {c.ExcludedChannelIds.Count} channel(s)");
+        if (c.ExcludedMessageIds.Count > 0)
+            lines.Add($"Excluding {c.ExcludedMessageIds.Count} specific message(s)");
+        lines.Add(
+            c.AllowIncompleteMedia
+                ? "Including channels whose media backup is incomplete"
+                : "Skipping channels with incomplete export or missing media"
+        );
+        return lines;
+    }
 
     public record SignInRequest(string Token);
 

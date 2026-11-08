@@ -854,14 +854,39 @@ function renderPreview(runId, run, p) {
 
   wrap.append(el("div", { class: "stat-row" }, el("div", {}, el("div", { class: "stat" }, String(p.totalCandidates)), el("div", { class: "muted" }, "would be deleted")), el("div", {}, el("div", { class: "stat" }, String(p.totalKept)), el("div", { class: "muted" }, "protected / kept"))));
 
+  // Restate exactly the rule set the server will act on, so this is a decision screen, not a
+  // leap of faith about whatever the filters above were left at.
+  if (p.criteriaSummary && p.criteriaSummary.length) {
+    const rules = el("ul", { class: "del-criteria" });
+    for (const line of p.criteriaSummary) rules.append(el("li", {}, line));
+    wrap.append(el("div", { class: "del-criteria-box" }, el("div", { class: "del-criteria-title" }, "Rules being applied"), rules));
+  }
+
   if (p.totalCandidates === 0) {
     wrap.append(el("div", { class: "banner warn" }, "Nothing matches — adjust the filters above."));
     return wrap;
   }
 
-  // What will be gone, and from where: per-channel counts with a few example messages.
+  // One row per kept/deleted sample message, with media markers so a text-only preview can't
+  // hide that you're about to delete (or are keeping) a message that carries an image/sticker.
+  function sampleRow(m, kind) {
+    const marks = [];
+    if (m.attachments) marks.push("📎");
+    if (m.stickers) marks.push("🖼");
+    if (m.forwarded) marks.push("➦");
+    return el(
+      "div",
+      { class: "del-sample " + kind },
+      el("span", { class: "del-sample-author", style: `color:${authorColor(m.authorName)}` }, m.authorName),
+      el("span", { class: "del-sample-ts muted small" }, fmtTime(m.timestamp)),
+      el("span", { class: "del-sample-text" }, m.content || el("span", { class: "muted" }, "(no text)")),
+      marks.length ? el("span", { class: "del-sample-media", title: "has media" }, marks.join(" ")) : null,
+      m.reason ? el("span", { class: "pill muted del-sample-reason" }, "kept: " + m.reason) : null,
+    );
+  }
+
   const samplesByChannel = Object.fromEntries((p.samples || []).map((s) => [s.channelId, s]));
-  wrap.append(el("p", { class: "muted small" }, "These messages will be permanently deleted from Discord. Review by channel below — protect anything you want to keep in “Browse & protect messages” first."));
+  wrap.append(el("p", { class: "muted small" }, "These messages will be permanently deleted from Discord. Each channel shows a few that will go and a few that are kept (and why). Protect anything else you want to keep in “Browse & protect messages” first."));
 
   const list = el("div", { class: "del-list" });
   const channelsToShow = p.channels.filter((c) => c.candidateCount > 0).sort((a, b) => b.candidateCount - a.candidateCount);
@@ -875,19 +900,14 @@ function renderPreview(runId, run, p) {
       c.keptCount ? el("span", { class: "pill muted" }, `${c.keptCount} kept`) : null,
     );
     const samples = el("div", { class: "del-samples" });
-    if (s && s.sample) {
-      for (const m of s.sample) {
-        samples.append(
-          el(
-            "div",
-            { class: "del-sample" },
-            el("span", { class: "del-sample-author", style: `color:${authorColor(m.authorName)}` }, m.authorName),
-            el("span", { class: "del-sample-ts muted small" }, fmtTime(m.timestamp)),
-            el("span", { class: "del-sample-text" }, m.content || el("span", { class: "muted" }, "(no text)")),
-          ),
-        );
-      }
-      if (c.candidateCount > s.sample.length) samples.append(el("div", { class: "muted small del-more" }, `…and ${c.candidateCount - s.sample.length} more in #${c.channelName}`));
+    const del = (s && s.deleteSample) || [];
+    const keep = (s && s.keepSample) || [];
+    for (const m of del) samples.append(sampleRow(m, "will-delete"));
+    if (c.candidateCount > del.length) samples.append(el("div", { class: "muted small del-more" }, `…and ${c.candidateCount - del.length} more to delete`));
+    if (keep.length) {
+      samples.append(el("div", { class: "del-kept-head muted small" }, "Kept here:"));
+      for (const m of keep) samples.append(sampleRow(m, "will-keep"));
+      if (c.keptCount > keep.length) samples.append(el("div", { class: "muted small del-more" }, `…and ${c.keptCount - keep.length} more kept`));
     }
     list.append(el("div", { class: "del-chan" }, head, samples));
   }

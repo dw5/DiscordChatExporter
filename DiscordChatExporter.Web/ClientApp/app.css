@@ -725,6 +725,50 @@ a {
 .del-more {
   padding: 4px 0 2px;
 }
+.del-criteria-box {
+  margin: 10px 0 6px;
+  padding: 10px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.del-criteria-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.del-criteria {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--text);
+}
+.del-criteria li {
+  margin: 2px 0;
+}
+/* Deleted samples get a faint red edge; kept samples a green one, so the two sets read apart. */
+.del-sample.will-delete {
+  border-left: 2px solid var(--danger, #e5484d);
+  padding-left: 8px;
+}
+.del-sample.will-keep {
+  border-left: 2px solid #3a9d5d;
+  padding-left: 8px;
+}
+.del-kept-head {
+  margin-top: 6px;
+  font-weight: 600;
+}
+.del-sample-media {
+  flex: 0 0 auto;
+  font-size: 12px;
+}
+.del-sample-reason {
+  flex: 0 0 auto;
+}
 
 @media (max-width: 720px) {
   .dc-sidebar {
