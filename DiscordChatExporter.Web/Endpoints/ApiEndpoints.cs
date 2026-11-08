@@ -310,9 +310,12 @@ public static class ApiEndpoints
                 Func<MessageRecord, (bool WillDelete, string? KeptReason)>? decide = null;
                 if (!string.IsNullOrEmpty(planId) && manifest.GetPlan(planId) is { } planRow)
                 {
-                    var candidateSet = manifest
-                        .GetPlanItemIds(planId)
-                        .ToHashSet(StringComparer.Ordinal);
+                    // Membership for just this page's messages — never the whole (possibly millions)
+                    // candidate set — so review paging stays cheap on full-server archives.
+                    var candidateSet = manifest.GetPlanItemsAmong(
+                        planId,
+                        items.Select(m => m.Id).ToArray()
+                    );
                     var planCriteria = DeletionCriteria.FromCanonicalJson(planRow.CriteriaJson);
                     var channelsById = manifest
                         .GetChannels()

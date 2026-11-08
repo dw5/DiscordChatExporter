@@ -837,6 +837,36 @@ public sealed class ManifestStore : IAsyncDisposable
         return list;
     }
 
+    // Which of the given message IDs are in a plan's candidate set. Used to annotate one page of the
+    // review reader without materializing the whole plan (which can be millions of rows) per page.
+    public IReadOnlySet<string> GetPlanItemsAmong(
+        string planId,
+        IReadOnlyCollection<string> messageIds
+    )
+    {
+        var result = new HashSet<string>(StringComparer.Ordinal);
+        if (messageIds.Count == 0)
+            return result;
+
+        using var conn = OpenRead();
+        using var cmd = conn.CreateCommand();
+        var placeholders = new List<string>(messageIds.Count);
+        var i = 0;
+        foreach (var id in messageIds)
+        {
+            var name = "$m" + i++;
+            placeholders.Add(name);
+            cmd.Parameters.AddWithValue(name, id);
+        }
+        cmd.Parameters.AddWithValue("$pid", planId);
+        cmd.CommandText =
+            $"SELECT message_id FROM plan_item WHERE plan_id=$pid AND message_id IN ({string.Join(",", placeholders)})";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+            result.Add(reader.GetString(0));
+        return result;
+    }
+
     public PlanRecord? GetPlan(string planId)
     {
         using var conn = OpenRead();

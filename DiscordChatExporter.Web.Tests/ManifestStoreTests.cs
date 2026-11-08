@@ -102,6 +102,21 @@ public class ManifestStoreTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task Plan_membership_query_returns_only_the_requested_ids_in_the_plan()
+    {
+        await using var store = Open();
+        await store.InitRunAsync(
+            new RunRecord("r", "g", "Guild", "me", "User", DateTimeOffset.UtcNow, null, "Json", 0)
+        );
+        await store.CreatePlanAsync("plan1", "{}", "me", "User", 1, ["1", "2", "3"]);
+        await store.FlushAsync();
+
+        // Only "2" is both asked-for and in the plan; "4" isn't in the plan, "1"/"3" weren't asked.
+        store.GetPlanItemsAmong("plan1", ["2", "4"]).Should().BeEquivalentTo(new[] { "2" });
+        store.GetPlanItemsAmong("plan1", []).Should().BeEmpty();
+    }
+
+    [Fact]
     public async Task Delete_status_is_persisted()
     {
         await using var store = Open();

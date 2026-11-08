@@ -524,12 +524,15 @@ function openMessageBrowser(runId, guildId, channels, opts) {
   let lastGroup = null; // { author, time }
   // Protecting/unprotecting a message bumps the manifest revision, which invalidates any plan the
   // caller previewed. Track it so the preview can re-run instead of submitting a now-stale plan (409).
+  // Track unprotects separately: those are the only edits that can ADD messages to the deletion set
+  // (protecting only ever removes), and an add can leave the total unchanged by replacing another.
   let keepChanged = false;
+  let unprotectedAny = false;
 
   const close = () => {
     document.removeEventListener("keydown", onKey);
     overlay.remove();
-    if (opts.onClose) opts.onClose(keepChanged);
+    if (opts.onClose) opts.onClose(keepChanged, unprotectedAny);
   };
   const onKey = (e) => e.key === "Escape" && close();
   closeBtn.addEventListener("click", close);
@@ -719,6 +722,7 @@ function openMessageBrowser(runId, guildId, channels, opts) {
         shield.title = next ? "Protected — click to unprotect" : "Protect from deletion";
         keptCount += next ? 1 : -1;
         keepChanged = true;
+        if (!next) unprotectedAny = true;
         updateKeptCounter();
         applyDecision();
       } catch (err) {
@@ -846,17 +850,15 @@ function deletionCard(runId, run, channels) {
 
   // One place that (re)builds the plan and renders it. The reader calls this again when inline
   // protections changed, so Delete always acts on a current plan rather than a stale one (409).
-  // fromReader marks a re-run triggered by reader edits: if it grew the set (someone unprotected a
-  // message), warn and point back to Review so the newly-included messages aren't deleted unseen.
-  let lastPreviewTotal = null;
-  async function runPreview(fromReader) {
+  // `unprotected` means the reader re-included at least one message (the only way edits can ADD to
+  // the set); we warn on that conservatively, since an add can replace another and leave the total
+  // unchanged — so counting candidates would miss it.
+  async function runPreview(unprotected) {
     clear(result);
     previewBtn.disabled = true;
     try {
       const p = await api.post(`/api/exports/${runId}/deletions/preview`, criteria());
-      const grew = fromReader && lastPreviewTotal !== null && p.totalCandidates > lastPreviewTotal;
-      lastPreviewTotal = p.totalCandidates;
-      result.append(renderPreview(runId, run, channels, p, runPreview, grew));
+      result.append(renderPreview(runId, run, channels, p, runPreview, !!unprotected));
     } catch (e) {
       result.append(el("div", { class: "banner danger" }, e.message));
     }
@@ -908,7 +910,7 @@ function parseRef(v) {
 function renderPreview(runId, run, channels, p, rerun, grew) {
   const wrap = el("div", { style: "margin-top:16px" });
   if (grew) {
-    wrap.append(el("div", { class: "banner danger" }, "You unprotected one or more messages, so the deletion set grew. Click “Review these messages” again to see exactly which messages are now set to delete before running."));
+    wrap.append(el("div", { class: "banner danger" }, "You unprotected one or more messages, so some may now be set to delete that weren’t before. Click “Review these messages” again to see exactly what will be deleted before running."));
   }
   if (p.accountMismatch) {
     wrap.append(el("div", { class: "banner danger" }, `This export was made by a different account. You are signed in as ${p.deletingUser.name}; under "only my own", only that account's messages are affected.`));
@@ -937,8 +939,10 @@ function renderPreview(runId, run, channels, p, rerun, grew) {
       planId: p.planId,
       // Protecting a message in the reader invalidates this plan (revision bump). Re-preview on
       // close so the counts, rules and Delete button reflect the new protections instead of 409ing.
-      onClose: (changed) => {
-        if (changed && rerun) rerun(true);
+      // Pass through whether anything was unprotected so the refreshed preview can warn if the set
+      // may have grown.
+      onClose: (changed, unprotected) => {
+        if (changed && rerun) rerun(unprotected);
       },
     }),
   );
