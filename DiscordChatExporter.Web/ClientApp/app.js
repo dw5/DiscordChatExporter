@@ -676,14 +676,23 @@ function openMessageBrowser(runId, guildId, channels, opts) {
       if (!reviewMode) return;
       const gone = m.deleteStatus === "Deleted" || m.deleteStatus === "Gone";
       const willDelete = !!m.willDelete && !m.keep && !gone;
+      // Unprotecting a message that wasn't in the frozen plan makes its real decision unknown: it
+      // may become a candidate once the plan is rebuilt (it depends on the other rules, which only
+      // the server knows). Never claim "kept" for it — say so and let the re-preview on close
+      // resolve it, so it can't silently flip to "will delete" behind an outdated label.
+      const indeterminate = !gone && !m.keep && !m.willDelete && m.unprotected;
       msg.classList.toggle("rev-delete", willDelete);
-      msg.classList.toggle("rev-keep", !willDelete);
+      msg.classList.toggle("rev-keep", !willDelete && !indeterminate);
+      msg.classList.toggle("rev-recheck", indeterminate);
       if (gone) {
         decisionBadge.textContent = "already gone";
         decisionBadge.className = "dc-decision gone";
       } else if (willDelete) {
         decisionBadge.textContent = "will delete";
         decisionBadge.className = "dc-decision del";
+      } else if (indeterminate) {
+        decisionBadge.textContent = "re-preview to confirm";
+        decisionBadge.className = "dc-decision recheck";
       } else {
         decisionBadge.textContent = m.keep ? "protected" : "kept" + (m.keptReason ? " · " + m.keptReason : "");
         decisionBadge.className = "dc-decision keep";
@@ -702,6 +711,9 @@ function openMessageBrowser(runId, guildId, channels, opts) {
       try {
         await api.put(`/api/exports/${runId}/messages/${m.id}/keep`, { keep: next });
         m.keep = next;
+        // Protecting resolves the decision (kept). Unprotecting a non-candidate makes it unknown
+        // until the plan is rebuilt — mark it so applyDecision shows "re-preview to confirm".
+        m.unprotected = !next && !m.willDelete;
         msg.classList.toggle("protected", next);
         shield.classList.toggle("on", next);
         shield.title = next ? "Protected — click to unprotect" : "Protect from deletion";
@@ -834,12 +846,17 @@ function deletionCard(runId, run, channels) {
 
   // One place that (re)builds the plan and renders it. The reader calls this again when inline
   // protections changed, so Delete always acts on a current plan rather than a stale one (409).
-  async function runPreview() {
+  // fromReader marks a re-run triggered by reader edits: if it grew the set (someone unprotected a
+  // message), warn and point back to Review so the newly-included messages aren't deleted unseen.
+  let lastPreviewTotal = null;
+  async function runPreview(fromReader) {
     clear(result);
     previewBtn.disabled = true;
     try {
       const p = await api.post(`/api/exports/${runId}/deletions/preview`, criteria());
-      result.append(renderPreview(runId, run, channels, p, runPreview));
+      const grew = fromReader && lastPreviewTotal !== null && p.totalCandidates > lastPreviewTotal;
+      lastPreviewTotal = p.totalCandidates;
+      result.append(renderPreview(runId, run, channels, p, runPreview, grew));
     } catch (e) {
       result.append(el("div", { class: "banner danger" }, e.message));
     }
@@ -847,7 +864,7 @@ function deletionCard(runId, run, channels) {
   }
 
   const previewBtn = el("button", {}, "Preview deletion");
-  previewBtn.addEventListener("click", runPreview);
+  previewBtn.addEventListener("click", () => runPreview(false));
 
   return el(
     "div",
@@ -888,8 +905,11 @@ function parseRef(v) {
   return /^\d+$/.test(v) ? v : null;
 }
 
-function renderPreview(runId, run, channels, p, rerun) {
+function renderPreview(runId, run, channels, p, rerun, grew) {
   const wrap = el("div", { style: "margin-top:16px" });
+  if (grew) {
+    wrap.append(el("div", { class: "banner danger" }, "You unprotected one or more messages, so the deletion set grew. Click “Review these messages” again to see exactly which messages are now set to delete before running."));
+  }
   if (p.accountMismatch) {
     wrap.append(el("div", { class: "banner danger" }, `This export was made by a different account. You are signed in as ${p.deletingUser.name}; under "only my own", only that account's messages are affected.`));
   }
@@ -918,7 +938,7 @@ function renderPreview(runId, run, channels, p, rerun) {
       // Protecting a message in the reader invalidates this plan (revision bump). Re-preview on
       // close so the counts, rules and Delete button reflect the new protections instead of 409ing.
       onClose: (changed) => {
-        if (changed && rerun) rerun();
+        if (changed && rerun) rerun(true);
       },
     }),
   );

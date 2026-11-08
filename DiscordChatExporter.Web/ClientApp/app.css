@@ -756,6 +756,9 @@ a {
 .dc-msg.rev-keep {
   box-shadow: inset 3px 0 0 #3a9d5d;
 }
+.dc-msg.rev-recheck {
+  box-shadow: inset 3px 0 0 #d6a52a;
+}
 .dc-decision {
   display: inline-block;
   font-size: 11px;
@@ -777,6 +780,10 @@ a {
 .dc-decision.gone {
   color: var(--muted);
   background: var(--panel);
+}
+.dc-decision.recheck {
+  color: #2a2000;
+  background: #d6a52a;
 }
 
 @media (max-width: 720px) {
