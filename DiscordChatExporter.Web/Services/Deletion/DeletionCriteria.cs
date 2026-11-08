@@ -151,6 +151,36 @@ public record DeletionCriteria
         return JsonSerializer.Serialize(normalized);
     }
 
+    // Inverse of ToCanonicalJson: reads back the canonical form a stored plan persisted. It reads
+    // the exact CanonicalForm shape (Scope is a string there) and maps it, so it never depends on
+    // the HTTP pipeline's JsonStringEnumConverter — a plain Deserialize<DeletionCriteria> would
+    // throw on the string scope and silently mis-shape the rest.
+    public static DeletionCriteria FromCanonicalJson(string json)
+    {
+        var c = JsonSerializer.Deserialize<CanonicalForm>(json);
+        if (c is null)
+            return new DeletionCriteria();
+
+        return new DeletionCriteria
+        {
+            Scope = Enum.TryParse<DeletionScope>(c.Scope, out var scope)
+                ? scope
+                : DeletionScope.Mine,
+            AuthorIds = c.AuthorIds,
+            ExcludedChannelIds = c.ExcludedChannelIds,
+            KeepPinned = c.KeepPinned,
+            KeepWithAttachments = c.KeepWithAttachments,
+            KeepIfContains = c.KeepIfContains,
+            ExcludedMessageIds = c.ExcludedMessageIds,
+            OnlyBefore = c.OnlyBefore,
+            OnlyAfter = c.OnlyAfter,
+            AllowIncompleteMedia = c.AllowIncompleteMedia,
+            OnlyContains = c.OnlyContains,
+            OnlyWithLink = c.OnlyWithLink,
+            OnlyWithAttachment = c.OnlyWithAttachment,
+        };
+    }
+
     private record CanonicalForm(
         string Scope,
         string[] AuthorIds,

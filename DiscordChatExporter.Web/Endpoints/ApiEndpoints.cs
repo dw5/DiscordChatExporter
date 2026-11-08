@@ -313,10 +313,7 @@ public static class ApiEndpoints
                     var candidateSet = manifest
                         .GetPlanItemIds(planId)
                         .ToHashSet(StringComparer.Ordinal);
-                    var planCriteria =
-                        System.Text.Json.JsonSerializer.Deserialize<DeletionCriteria>(
-                            planRow.CriteriaJson
-                        ) ?? new DeletionCriteria();
+                    var planCriteria = DeletionCriteria.FromCanonicalJson(planRow.CriteriaJson);
                     var channelsById = manifest
                         .GetChannels()
                         .ToDictionary(c => c.Id, StringComparer.Ordinal);

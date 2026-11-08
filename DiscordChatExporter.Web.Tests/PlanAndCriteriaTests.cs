@@ -87,6 +87,45 @@ public class PlanAndCriteriaTests
         a.ToCanonicalJson().Should().Be(b.ToCanonicalJson());
     }
 
+    [Theory]
+    [InlineData(DeletionScope.Mine)]
+    [InlineData(DeletionScope.Everyone)]
+    [InlineData(DeletionScope.Authors)]
+    public void Canonical_json_round_trips_through_FromCanonicalJson(DeletionScope scope)
+    {
+        // A persisted plan stores ToCanonicalJson(); the reader's review mode reads it back with
+        // FromCanonicalJson. Scope is serialized as a string, so a plain enum deserialize would
+        // throw — this guards that round-trip for every scope.
+        var original = new DeletionCriteria
+        {
+            Scope = scope,
+            AuthorIds = ["11", "22"],
+            ExcludedChannelIds = ["3", "1"],
+            KeepPinned = false,
+            KeepWithAttachments = true,
+            KeepIfContains = ["keep", "this"],
+            ExcludedMessageIds = ["99"],
+            OnlyBefore = "2025-01-01",
+            OnlyAfter = "2024-01-01",
+            AllowIncompleteMedia = true,
+            OnlyContains = "needle",
+            OnlyWithLink = true,
+            OnlyWithAttachment = true,
+        };
+
+        var restored = DeletionCriteria.FromCanonicalJson(original.ToCanonicalJson());
+
+        restored.Scope.Should().Be(scope);
+        restored.KeepPinned.Should().BeFalse();
+        restored.KeepWithAttachments.Should().BeTrue();
+        restored.OnlyContains.Should().Be("needle");
+        restored.OnlyWithLink.Should().BeTrue();
+        restored.AllowIncompleteMedia.Should().BeTrue();
+        restored.KeepIfContains.Should().BeEquivalentTo("keep", "this");
+        // The restored criteria must re-serialize identically, proving nothing was dropped.
+        restored.ToCanonicalJson().Should().Be(original.ToCanonicalJson());
+    }
+
     [Fact]
     public void PlanId_changes_with_revision()
     {
