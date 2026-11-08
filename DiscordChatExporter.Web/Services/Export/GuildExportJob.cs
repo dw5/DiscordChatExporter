@@ -223,9 +223,14 @@ public sealed class GuildExportJob(
                         ExportAssetDownloader.IsDiscordAttachmentUrl
                     );
 
-                    if (messageCount == 0)
+                    // Decide emptiness from what the exporter actually wrote to the output files
+                    // (result.MessagesExported), NOT from our manifest counter: WriteMessage
+                    // deliberately skips a thread's starter message (the parent channel records it),
+                    // so messageCount can be 0 for a thread whose HTML/JSON does contain its starter.
+                    // Keying off messageCount here would delete that populated export.
+                    if (result.MessagesExported == 0)
                     {
-                        // The crawl ran fine but produced no messages for this channel — typically
+                        // The crawl ran fine but produced no output for this channel — typically
                         // "only my messages" matching nothing here. Discard the empty HTML/JSON the
                         // exporter created so the export only contains channels with real content, and
                         // record it Empty so backup-gated deletion skips it (there is nothing of ours
