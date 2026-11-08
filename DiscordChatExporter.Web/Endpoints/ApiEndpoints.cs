@@ -428,8 +428,33 @@ public static class ApiEndpoints
 
         app.MapPut(
             "/api/exports/{runId}/messages/{messageId}/keep",
-            async (string runId, string messageId, KeepRequest body, RunRegistry registry) =>
+            async (
+                string runId,
+                string messageId,
+                KeepRequest body,
+                JobManager jobs,
+                RunRegistry registry
+            ) =>
             {
+                // While a deletion for this run is live, a message may already be dispatched, and
+                // Core's HTTP layer retries a 429'd DELETE without re-reading keep — so a protection
+                // committed now could lose the race and the message be deleted anyway. Refuse
+                // protection changes until the deletion finishes or is cancelled, which removes the
+                // window entirely (protection set before the run is still honoured pre-dispatch).
+                if (
+                    jobs.Current
+                        is { State: JobState.Running, Kind: JobKind.Deletion, RunId: var rid }
+                    && rid == runId
+                )
+                {
+                    return Results.Conflict(
+                        new
+                        {
+                            error = "A deletion is running for this export. Cancel or let it finish before changing protection.",
+                        }
+                    );
+                }
+
                 var manifest = registry.OpenManifestForRun(runId);
                 if (manifest is null)
                     return Results.NotFound();
