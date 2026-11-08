@@ -74,6 +74,12 @@ public static class DeletionPlanner
         if (message.DeleteStatus is MessageDeleteStatus.Deleted or MessageDeleteStatus.Gone)
             return MessageSkipReason.AlreadyGone;
 
+        // A message Discord reported as non-deletable can never be deleted, so it must not be
+        // counted as a candidate (it would otherwise inflate the preview vs. what runs). Other
+        // "skipped" states (no permission, archived thread) stay retryable and match execution.
+        if (message.DeleteStatus is MessageDeleteStatus.SkippedNotDeletable)
+            return MessageSkipReason.NotDeletableKind;
+
         if (criteria.ExcludedChannelIds.Contains(channel.Id, StringComparer.Ordinal))
             return MessageSkipReason.ChannelExcluded;
 

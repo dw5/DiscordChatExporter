@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
@@ -21,6 +22,7 @@ public sealed class ManifestStore : IAsyncDisposable
     );
     private readonly Task _writerTask;
     private readonly SqliteConnection _writeConnection;
+    private volatile Exception? _fault;
 
     private ManifestStore(string dbPath)
     {
@@ -36,6 +38,7 @@ public sealed class ManifestStore : IAsyncDisposable
         _writeConnection.Open();
         Execute(_writeConnection, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
         CreateSchema(_writeConnection);
+        MigrateSchema(_writeConnection);
 
         _writerTask = Task.Run(RunWriterAsync);
     }
@@ -63,6 +66,8 @@ public sealed class ManifestStore : IAsyncDisposable
             );
             CREATE TABLE IF NOT EXISTS message (
                 id TEXT PRIMARY KEY, channel_id TEXT, author_id TEXT, author_name TEXT,
+                author_avatar TEXT,
+                stickers_json TEXT, forwarded_json TEXT,
                 timestamp INTEGER, kind INTEGER, is_pinned INTEGER, content TEXT,
                 attachment_count INTEGER, embed_count INTEGER,
                 keep INTEGER NOT NULL DEFAULT 0,
@@ -70,9 +75,14 @@ public sealed class ManifestStore : IAsyncDisposable
             );
             CREATE INDEX IF NOT EXISTS ix_message_channel ON message(channel_id);
             CREATE INDEX IF NOT EXISTS ix_message_order ON message(timestamp, id);
+            CREATE TABLE IF NOT EXISTS attachment (
+                message_id TEXT, idx INTEGER, file_name TEXT, local_name TEXT, url TEXT,
+                kind TEXT, is_spoiler INTEGER, PRIMARY KEY (message_id, idx)
+            );
+            CREATE INDEX IF NOT EXISTS ix_attachment_msg ON attachment(message_id);
             CREATE TABLE IF NOT EXISTS failed_asset (
                 message_id TEXT, channel_id TEXT, url TEXT, retried_at INTEGER, local_path TEXT,
-                PRIMARY KEY (message_id, url)
+                PRIMARY KEY (channel_id, message_id, url)
             );
             CREATE TABLE IF NOT EXISTS plan (
                 id TEXT PRIMARY KEY, created_at INTEGER, criteria_json TEXT, user_id TEXT,
@@ -83,6 +93,65 @@ public sealed class ManifestStore : IAsyncDisposable
             );
             """
         );
+
+    // Adds columns introduced after the first schema so manifests from earlier exports keep working
+    // without a re-export. SQLite has no "ADD COLUMN IF NOT EXISTS", so we check first.
+    private static void MigrateSchema(SqliteConnection conn)
+    {
+        var columns = new HashSet<string>(StringComparer.Ordinal);
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(message)";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+                columns.Add(reader.GetString(1));
+        }
+
+        if (!columns.Contains("author_avatar"))
+            Execute(conn, "ALTER TABLE message ADD COLUMN author_avatar TEXT");
+        if (!columns.Contains("stickers_json"))
+            Execute(conn, "ALTER TABLE message ADD COLUMN stickers_json TEXT");
+        if (!columns.Contains("forwarded_json"))
+            Execute(conn, "ALTER TABLE message ADD COLUMN forwarded_json TEXT");
+
+        // Older manifests keyed failed_asset by (message_id, url) only, so the same URL failing in
+        // two channels collapsed to one row and a channel could be wrongly promoted to Complete
+        // (R4). Rebuild the table keyed by (channel_id, message_id, url). Recovery state is only
+        // ever repopulated by a fresh export/retry, so dropping any stale rows is safe.
+        var channelInFailedAssetPk = false;
+        var failedAssetExists = false;
+        using (var cmd = conn.CreateCommand())
+        {
+            cmd.CommandText = "PRAGMA table_info(failed_asset)";
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                failedAssetExists = true;
+                if (reader.GetString(1) == "channel_id" && reader.GetInt32(5) > 0)
+                    channelInFailedAssetPk = true;
+            }
+        }
+
+        if (failedAssetExists && !channelInFailedAssetPk)
+            // Preserve existing unresolved failures while re-keying, so a media-retry can't promote
+            // a channel to Complete just because migration lost its missing-attachment rows (R2).
+            Execute(
+                conn,
+                """
+                BEGIN;
+                CREATE TABLE failed_asset_new (
+                    message_id TEXT, channel_id TEXT, url TEXT, retried_at INTEGER, local_path TEXT,
+                    PRIMARY KEY (channel_id, message_id, url)
+                );
+                INSERT OR IGNORE INTO failed_asset_new
+                    (message_id, channel_id, url, retried_at, local_path)
+                    SELECT message_id, channel_id, url, retried_at, local_path FROM failed_asset;
+                DROP TABLE failed_asset;
+                ALTER TABLE failed_asset_new RENAME TO failed_asset;
+                COMMIT;
+                """
+            );
+    }
 
     // ---- Background writer --------------------------------------------------------------------
 
@@ -96,27 +165,28 @@ public sealed class ManifestStore : IAsyncDisposable
 
             var pendingMessages = new List<MessageRecord>();
 
-            void FlushMessages()
-            {
-                if (pendingMessages.Count == 0)
-                    return;
-
-                using var tx = _writeConnection.BeginTransaction();
-                foreach (var message in pendingMessages)
-                    InsertMessage(_writeConnection, tx, message);
-                tx.Commit();
-                pendingMessages.Clear();
-            }
-
             foreach (var op in batch)
             {
+                // Once the store has faulted (e.g. a message insert failed irrecoverably), every
+                // further operation fails deterministically instead of hanging forever.
+                if (_fault is not null)
+                {
+                    op.Completion?.TrySetException(_fault);
+                    continue;
+                }
+
                 if (op.Message is not null)
                 {
                     pendingMessages.Add(op.Message);
                     continue;
                 }
 
-                FlushMessages();
+                // Flush buffered messages before the action so ordering holds
+                if (!TryFlush(pendingMessages))
+                {
+                    op.Completion?.TrySetException(_fault!);
+                    continue;
+                }
 
                 try
                 {
@@ -131,14 +201,31 @@ public sealed class ManifestStore : IAsyncDisposable
                 }
             }
 
-            try
-            {
-                FlushMessages();
-            }
-            catch
-            {
-                // Individual message inserts are best-effort; a failure here must not stop the writer
-            }
+            if (_fault is null)
+                TryFlush(pendingMessages);
+        }
+    }
+
+    // Flushes buffered message inserts in one transaction. On failure, faults the whole store so
+    // the failure surfaces (via the next FlushAsync) rather than silently losing manifest rows.
+    private bool TryFlush(List<MessageRecord> pendingMessages)
+    {
+        if (pendingMessages.Count == 0)
+            return true;
+
+        try
+        {
+            using var tx = _writeConnection.BeginTransaction();
+            foreach (var message in pendingMessages)
+                InsertMessage(_writeConnection, tx, message);
+            tx.Commit();
+            pendingMessages.Clear();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _fault = ex;
+            return false;
         }
     }
 
@@ -148,9 +235,10 @@ public sealed class ManifestStore : IAsyncDisposable
         cmd.Transaction = tx;
         cmd.CommandText = """
             INSERT OR REPLACE INTO message
-                (id, channel_id, author_id, author_name, timestamp, kind, is_pinned, content,
-                 attachment_count, embed_count, keep, delete_status)
-            VALUES ($id,$cid,$aid,$aname,$ts,$kind,$pin,$content,$att,$emb,
+                (id, channel_id, author_id, author_name, author_avatar, stickers_json,
+                 forwarded_json, timestamp, kind, is_pinned,
+                 content, attachment_count, embed_count, keep, delete_status)
+            VALUES ($id,$cid,$aid,$aname,$avatar,$stk,$fwd,$ts,$kind,$pin,$content,$att,$emb,
                 COALESCE((SELECT keep FROM message WHERE id=$id),0),
                 COALESCE((SELECT delete_status FROM message WHERE id=$id),'None'))
             """;
@@ -158,6 +246,17 @@ public sealed class ManifestStore : IAsyncDisposable
         cmd.Parameters.AddWithValue("$cid", m.ChannelId);
         cmd.Parameters.AddWithValue("$aid", m.AuthorId);
         cmd.Parameters.AddWithValue("$aname", m.AuthorName);
+        cmd.Parameters.AddWithValue("$avatar", (object?)m.AuthorAvatarUrl ?? DBNull.Value);
+        cmd.Parameters.AddWithValue(
+            "$stk",
+            m.Stickers is { Count: > 0 }
+                ? JsonSerializer.Serialize(m.Stickers)
+                : (object)DBNull.Value
+        );
+        cmd.Parameters.AddWithValue(
+            "$fwd",
+            m.Forwarded is not null ? JsonSerializer.Serialize(m.Forwarded) : (object)DBNull.Value
+        );
         cmd.Parameters.AddWithValue("$ts", m.Timestamp.ToUnixTimeMilliseconds());
         cmd.Parameters.AddWithValue("$kind", m.Kind);
         cmd.Parameters.AddWithValue("$pin", m.IsPinned ? 1 : 0);
@@ -165,6 +264,38 @@ public sealed class ManifestStore : IAsyncDisposable
         cmd.Parameters.AddWithValue("$att", m.AttachmentCount);
         cmd.Parameters.AddWithValue("$emb", m.EmbedCount);
         cmd.ExecuteNonQuery();
+
+        // Replace this message's attachment rows so a re-export stays consistent.
+        using (var del = conn.CreateCommand())
+        {
+            del.Transaction = tx;
+            del.CommandText = "DELETE FROM attachment WHERE message_id=$id";
+            del.Parameters.AddWithValue("$id", m.Id);
+            del.ExecuteNonQuery();
+        }
+
+        if (m.Attachments is { Count: > 0 })
+        {
+            var idx = 0;
+            foreach (var a in m.Attachments)
+            {
+                using var ins = conn.CreateCommand();
+                ins.Transaction = tx;
+                ins.CommandText = """
+                    INSERT OR REPLACE INTO attachment
+                        (message_id, idx, file_name, local_name, url, kind, is_spoiler)
+                    VALUES ($id,$idx,$fn,$ln,$url,$kind,$sp)
+                    """;
+                ins.Parameters.AddWithValue("$id", m.Id);
+                ins.Parameters.AddWithValue("$idx", idx++);
+                ins.Parameters.AddWithValue("$fn", a.FileName);
+                ins.Parameters.AddWithValue("$ln", a.LocalName);
+                ins.Parameters.AddWithValue("$url", a.Url);
+                ins.Parameters.AddWithValue("$kind", a.Kind);
+                ins.Parameters.AddWithValue("$sp", a.IsSpoiler ? 1 : 0);
+                ins.ExecuteNonQuery();
+            }
+        }
     }
 
     // ---- Write API (enqueued) -----------------------------------------------------------------
@@ -496,6 +627,49 @@ public sealed class ManifestStore : IAsyncDisposable
         return list;
     }
 
+    // Reads the manifest revision, channels and messages from a single consistent snapshot, so a
+    // concurrent keep toggle can't produce a plan whose candidates and revision disagree (R3).
+    public (
+        long Revision,
+        IReadOnlyList<ChannelRecord> Channels,
+        IReadOnlyList<MessageRecord> Messages
+    ) ReadPlanningSnapshot()
+    {
+        using var conn = OpenRead();
+        // WAL: a read transaction sees one consistent snapshot across all statements in it.
+        using var tx = conn.BeginTransaction();
+
+        long revision;
+        using (var revCmd = conn.CreateCommand())
+        {
+            revCmd.Transaction = tx;
+            revCmd.CommandText = "SELECT manifest_revision FROM run LIMIT 1";
+            revision = Convert.ToInt64(revCmd.ExecuteScalar() ?? 0L, CultureInfo.InvariantCulture);
+        }
+
+        var channels = new List<ChannelRecord>();
+        using (var chanCmd = conn.CreateCommand())
+        {
+            chanCmd.Transaction = tx;
+            chanCmd.CommandText = "SELECT * FROM channel ORDER BY path";
+            using var reader = chanCmd.ExecuteReader();
+            while (reader.Read())
+                channels.Add(ReadChannel(reader));
+        }
+
+        var messages = new List<MessageRecord>();
+        using (var msgCmd = conn.CreateCommand())
+        {
+            msgCmd.Transaction = tx;
+            msgCmd.CommandText = "SELECT * FROM message";
+            using var reader = msgCmd.ExecuteReader();
+            while (reader.Read())
+                messages.Add(ReadMessage(reader));
+        }
+
+        return (revision, channels, messages);
+    }
+
     public (IReadOnlyList<MessageRecord> Items, int NextCursor, int Total) QueryMessages(
         string? channelId,
         string? authorId,
@@ -532,13 +706,59 @@ public sealed class ManifestStore : IAsyncDisposable
         cmd.Parameters.AddWithValue("$limit", limit);
         cmd.Parameters.AddWithValue("$offset", cursor);
 
-        using var reader = cmd.ExecuteReader();
         var items = new List<MessageRecord>();
-        while (reader.Read())
-            items.Add(ReadMessage(reader));
+        using (var reader = cmd.ExecuteReader())
+        {
+            while (reader.Read())
+                items.Add(ReadMessage(reader));
+        }
+
+        // Attach each message's attachment rows (one extra query for the whole page).
+        var attachments = LoadAttachments(conn, items.Select(m => m.Id));
+        if (attachments.Count > 0)
+            items = items
+                .Select(m => m with { Attachments = attachments.GetValueOrDefault(m.Id) })
+                .ToList();
 
         var next = cursor + items.Count;
         return (items, next < total ? next : -1, total);
+    }
+
+    private static Dictionary<string, List<AttachmentRecord>> LoadAttachments(
+        SqliteConnection conn,
+        IEnumerable<string> messageIds
+    )
+    {
+        var ids = messageIds.ToList();
+        var map = new Dictionary<string, List<AttachmentRecord>>(StringComparer.Ordinal);
+        if (ids.Count == 0)
+            return map;
+
+        using var cmd = conn.CreateCommand();
+        var names = ids.Select((_, i) => "$a" + i).ToArray();
+        cmd.CommandText =
+            "SELECT message_id, file_name, local_name, url, kind, is_spoiler FROM attachment "
+            + $"WHERE message_id IN ({string.Join(",", names)}) ORDER BY message_id, idx";
+        for (var i = 0; i < ids.Count; i++)
+            cmd.Parameters.AddWithValue(names[i], ids[i]);
+
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            var mid = reader.GetString(0);
+            if (!map.TryGetValue(mid, out var list))
+                map[mid] = list = [];
+            list.Add(
+                new AttachmentRecord(
+                    reader.GetString(1),
+                    reader.GetString(2),
+                    reader.GetString(3),
+                    reader.GetString(4),
+                    reader.GetInt64(5) != 0
+                )
+            );
+        }
+        return map;
     }
 
     private static void BindMessageFilters(
@@ -574,8 +794,35 @@ public sealed class ManifestStore : IAsyncDisposable
             reader.GetInt32(reader.GetOrdinal("attachment_count")),
             reader.GetInt32(reader.GetOrdinal("embed_count")),
             reader.GetInt64(reader.GetOrdinal("keep")) != 0,
-            Enum.Parse<MessageDeleteStatus>(reader.GetString(reader.GetOrdinal("delete_status")))
+            Enum.Parse<MessageDeleteStatus>(reader.GetString(reader.GetOrdinal("delete_status"))),
+            AuthorAvatarUrl: reader.IsDBNull(reader.GetOrdinal("author_avatar"))
+                ? null
+                : reader.GetString(reader.GetOrdinal("author_avatar")),
+            Stickers: DeserializeOrNull<IReadOnlyList<StickerRecord>>(reader, "stickers_json"),
+            Forwarded: DeserializeOrNull<ForwardedRecord>(reader, "forwarded_json")
         );
+
+    // Reads a JSON column that may be absent (older manifest) or null. GetOrdinal throws if the
+    // column doesn't exist, so a pre-migration row with no such column stays null rather than faulting.
+    private static T? DeserializeOrNull<T>(SqliteDataReader reader, string column)
+        where T : class
+    {
+        int ordinal;
+        try
+        {
+            ordinal = reader.GetOrdinal(column);
+        }
+        catch (IndexOutOfRangeException)
+        {
+            return null;
+        }
+
+        if (reader.IsDBNull(ordinal))
+            return null;
+
+        var json = reader.GetString(ordinal);
+        return string.IsNullOrEmpty(json) ? null : JsonSerializer.Deserialize<T>(json);
+    }
 
     public IReadOnlyList<string> GetPlanItemIds(string planId)
     {

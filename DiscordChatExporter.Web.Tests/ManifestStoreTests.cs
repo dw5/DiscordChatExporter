@@ -135,4 +135,167 @@ public class ManifestStoreTests : IAsyncLifetime
 
         store.GetMessage("1")!.Keep.Should().BeTrue();
     }
+
+    [Fact]
+    public async Task Message_attachments_round_trip_through_query()
+    {
+        await using var store = Open();
+        await store.InitRunAsync(
+            new RunRecord("r", "g", "Guild", "me", "User", DateTimeOffset.UtcNow, null, "Json", 0)
+        );
+        store.EnqueueMessage(
+            Msg("1") with
+            {
+                AttachmentCount = 2,
+                Attachments =
+                [
+                    new AttachmentRecord(
+                        "pic.png",
+                        "pic-abcde.png",
+                        "https://cdn/pic.png",
+                        "image",
+                        false
+                    ),
+                    new AttachmentRecord(
+                        "clip.mp4",
+                        "clip-12345.mp4",
+                        "https://cdn/clip.mp4",
+                        "video",
+                        true
+                    ),
+                ],
+            }
+        );
+        await store.FlushAsync();
+
+        var (items, _, _) = store.QueryMessages(null, null, null, null, 0, 50);
+        var msg = items.Single(m => m.Id == "1");
+        msg.Attachments.Should().NotBeNull();
+        msg.Attachments!.Should().HaveCount(2);
+        msg.Attachments![0].LocalName.Should().Be("pic-abcde.png");
+        msg.Attachments![0].Kind.Should().Be("image");
+        msg.Attachments![1].IsSpoiler.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task Stickers_and_forwarded_message_round_trip_through_query()
+    {
+        await using var store = Open();
+        await store.InitRunAsync(
+            new RunRecord("r", "g", "Guild", "me", "User", DateTimeOffset.UtcNow, null, "Json", 0)
+        );
+        store.EnqueueMessage(
+            Msg("1") with
+            {
+                Stickers = [new StickerRecord("wave", "https://cdn/stickers/1.png", true)],
+                Forwarded = new ForwardedRecord(
+                    "forwarded text",
+                    [new StickerRecord("hi", "https://cdn/stickers/2.png", false)],
+                    [
+                        new AttachmentRecord(
+                            "f.png",
+                            "f-abc.png",
+                            "https://cdn/f.png",
+                            "image",
+                            false
+                        ),
+                    ]
+                ),
+            }
+        );
+        await store.FlushAsync();
+
+        var (items, _, _) = store.QueryMessages(null, null, null, null, 0, 50);
+        var msg = items.Single(m => m.Id == "1");
+        msg.Stickers.Should().ContainSingle(s => s.Name == "wave" && s.IsImage);
+        msg.Forwarded.Should().NotBeNull();
+        msg.Forwarded!.Content.Should().Be("forwarded text");
+        msg.Forwarded.Stickers.Should().ContainSingle(s => s.Name == "hi" && !s.IsImage);
+        msg.Forwarded.Attachments.Should().ContainSingle(a => a.LocalName == "f-abc.png");
+    }
+
+    [Fact]
+    public async Task Reexport_replaces_attachment_rows()
+    {
+        await using var store = Open();
+        await store.InitRunAsync(
+            new RunRecord("r", "g", "Guild", "me", "User", DateTimeOffset.UtcNow, null, "Json", 0)
+        );
+        store.EnqueueMessage(
+            Msg("1") with
+            {
+                Attachments = [new AttachmentRecord("a.png", "a.png", "u", "image", false)],
+            }
+        );
+        await store.FlushAsync();
+        store.EnqueueMessage(
+            Msg("1") with
+            {
+                Attachments = [new AttachmentRecord("b.png", "b.png", "u2", "image", false)],
+            }
+        );
+        await store.FlushAsync();
+
+        var (items, _, _) = store.QueryMessages(null, null, null, null, 0, 50);
+        items
+            .Single(m => m.Id == "1")
+            .Attachments!.Should()
+            .ContainSingle(a => a.FileName == "b.png");
+    }
+
+    [Fact]
+    public async Task Failed_assets_are_tracked_per_channel()
+    {
+        // The same URL failing in two channels must keep both rows, or media retry could promote
+        // one channel to Complete while the other's backup is still missing (R4).
+        await using var store = Open();
+        await store.InitRunAsync(
+            new RunRecord("r", "g", "Guild", "me", "User", DateTimeOffset.UtcNow, null, "Json", 0)
+        );
+        await store.RecordFailedAssetAsync("", "chanA", "https://cdn/x.png");
+        await store.RecordFailedAssetAsync("", "chanB", "https://cdn/x.png");
+        await store.FlushAsync();
+
+        var failed = store.GetFailedAssets(onlyUnrecovered: true);
+        failed.Select(f => f.ChannelId).Should().BeEquivalentTo("chanA", "chanB");
+    }
+
+    [Fact]
+    public async Task Planning_snapshot_returns_revision_channels_and_messages_together()
+    {
+        await using var store = Open();
+        await store.InitRunAsync(
+            new RunRecord("r", "g", "Guild", "me", "User", DateTimeOffset.UtcNow, null, "Json", 0)
+        );
+        await store.UpsertChannelAsync(
+            new ChannelRecord(
+                "c1",
+                null,
+                "general",
+                "Guild / general",
+                "general",
+                0,
+                false,
+                false,
+                ChannelExportStatus.Complete,
+                2,
+                null,
+                0
+            )
+        );
+        store.EnqueueMessage(Msg("1"));
+        store.EnqueueMessage(Msg("2"));
+        await store.FlushAsync();
+
+        await store.SetKeepAsync("1", true);
+        await store.FlushAsync();
+        var expectedRevision = store.GetManifestRevision();
+
+        var (revision, channels, messages) = store.ReadPlanningSnapshot();
+
+        revision.Should().Be(expectedRevision);
+        channels.Should().ContainSingle(c => c.Id == "c1");
+        messages.Select(m => m.Id).Should().BeEquivalentTo("1", "2");
+        messages.Single(m => m.Id == "1").Keep.Should().BeTrue();
+    }
 }

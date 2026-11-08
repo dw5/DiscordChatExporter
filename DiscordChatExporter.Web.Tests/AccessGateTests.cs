@@ -108,6 +108,30 @@ public class AccessGateTests : IClassFixture<WebAppFactory>
         var body = await response.Content.ReadAsStringAsync();
         body.Should().Contain("id=\"app\"");
     }
+
+    [Fact]
+    public async Task Files_directory_renders_a_script_free_listing()
+    {
+        var registry = (DiscordChatExporter.Web.Services.RunRegistry)
+            _factory.Services.GetService(typeof(DiscordChatExporter.Web.Services.RunRegistry))!;
+        var runDir = Path.Combine(registry.ExportsDir, "Guild [1]", "run-listing-test");
+        Directory.CreateDirectory(runDir);
+        await File.WriteAllTextAsync(Path.Combine(runDir, "channel.html"), "<p>hi</p>");
+
+        var client = NoRedirectClient();
+        var request = new HttpRequestMessage(HttpMethod.Get, "/files/run-listing-test/");
+        request.Headers.Add("Cookie", $"{AccessGate.CookieName}={WebAppFactory.TestKey}");
+        var response = await client.SendAsync(request);
+
+        response.StatusCode.Should().Be(HttpStatusCode.OK);
+        response.Content.Headers.ContentType!.MediaType.Should().Be("text/html");
+        response
+            .Headers.GetValues("Content-Security-Policy")
+            .Should()
+            .Contain(v => v.Contains("script-src 'none'"));
+        var body = await response.Content.ReadAsStringAsync();
+        body.Should().Contain("channel.html");
+    }
 }
 
 public sealed class WebAppFactory : WebApplicationFactory<Program>

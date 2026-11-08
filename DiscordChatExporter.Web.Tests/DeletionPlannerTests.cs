@@ -63,6 +63,54 @@ public class DeletionPlannerTests
     }
 
     [Fact]
+    public void Pre_epoch_before_boundary_matches_nothing_not_everything()
+    {
+        // Regression for the snowflake underflow (R2): "before 2014" (pre-Discord) must delete
+        // nothing, not wrap into a huge future snowflake that selects every message.
+        var plan = Plan(
+            new DeletionCriteria { Scope = DeletionScope.Everyone, OnlyBefore = "2014-01-01" },
+            [Channel("c1")],
+            [Message("100"), Message("200")]
+        );
+
+        plan.CandidateMessageIds.Should().BeEmpty();
+    }
+
+    [Fact]
+    public void Non_deletable_skipped_messages_are_not_candidates()
+    {
+        // Preview must not promise messages Discord already said can't be deleted (R3).
+        var plan = Plan(
+            new DeletionCriteria { Scope = DeletionScope.Everyone },
+            [Channel("c1")],
+            [
+                Message("1", delete: MessageDeleteStatus.SkippedNotDeletable),
+                Message("2", delete: MessageDeleteStatus.None),
+            ]
+        );
+
+        plan.CandidateMessageIds.Should().BeEquivalentTo("2");
+    }
+
+    [Fact]
+    public void Transiently_skipped_messages_remain_candidates()
+    {
+        // No-permission / archived-thread skips are retryable and stay candidates, matching what
+        // the deletion job will re-attempt (R3).
+        var plan = Plan(
+            new DeletionCriteria { Scope = DeletionScope.Everyone },
+            [Channel("c1")],
+            [
+                Message("1", delete: MessageDeleteStatus.SkippedNoPermission),
+                Message("2", delete: MessageDeleteStatus.SkippedArchivedThread),
+                Message("3", delete: MessageDeleteStatus.Failed),
+            ]
+        );
+
+        plan.CandidateMessageIds.Should().BeEquivalentTo("1", "2", "3");
+    }
+
+    [Fact]
     public void Everyone_scope_selects_all_deletable()
     {
         var plan = Plan(

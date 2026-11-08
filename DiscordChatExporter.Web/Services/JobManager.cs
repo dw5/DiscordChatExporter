@@ -92,10 +92,19 @@ public sealed class Job
             return _log.ToArray();
     }
 
-    // Subscribe for SSE. Returns a reader that first replays history, then streams live events.
-    public ChannelReader<JobEvent> Subscribe()
+    // Subscribe for SSE. Returns a disposable that first replays history, then streams live events;
+    // disposing it (when the client disconnects) unregisters the subscription so it can't leak and
+    // keep receiving events for the rest of the job (R6). The queue is bounded and drops its oldest
+    // events for a slow consumer rather than growing without limit.
+    public JobSubscription Subscribe()
     {
-        var channel = Channel.CreateUnbounded<JobEvent>();
+        var channel = Channel.CreateBounded<JobEvent>(
+            new BoundedChannelOptions(2048)
+            {
+                FullMode = BoundedChannelFullMode.DropOldest,
+                SingleReader = true,
+            }
+        );
         lock (_lock)
         {
             foreach (var past in _history)
@@ -106,7 +115,15 @@ public sealed class Job
             else
                 _subscribers.Add(channel);
         }
-        return channel.Reader;
+        return new JobSubscription(
+            channel.Reader,
+            () =>
+            {
+                lock (_lock)
+                    _subscribers.Remove(channel);
+                channel.Writer.TryComplete();
+            }
+        );
     }
 
     private void Emit(JobEvent evt)
@@ -124,11 +141,31 @@ public sealed class Job
 
 public record JobEvent(string Type, object Payload);
 
+// A live SSE subscription. Dispose unregisters it from the job so a disconnected client's queue
+// stops accumulating events.
+public sealed class JobSubscription(ChannelReader<JobEvent> reader, Action onDispose) : IDisposable
+{
+    private int _disposed;
+
+    public ChannelReader<JobEvent> Reader { get; } = reader;
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 0)
+            onDispose();
+    }
+}
+
 // Runs at most one job at a time across the whole app.
 public sealed class JobManager
 {
     private readonly object _lock = new();
     private Job? _current;
+
+    // True while a session sign-in/out is in progress. Held across the (async) sign-in so a job
+    // cannot start mid-change and a change cannot start mid-job: together with the running-job
+    // check this keeps every job bound to one account for its whole lifetime.
+    private bool _sessionChanging;
     private readonly ConcurrentDictionary<string, Job> _jobs = new();
 
     public Job? Current
@@ -144,13 +181,42 @@ public sealed class JobManager
 
     public Job? Get(string id) => _jobs.GetValueOrDefault(id);
 
-    // Starts a job unless one is already running. Returns null if busy.
-    public Job? TryStart(JobKind kind, string? runId, Func<Job, CancellationToken, Task> work)
+    // Reserves the right to change the session. Fails if a job is running or another change is in
+    // flight. The caller must pair a true result with EndSessionChange() in a finally.
+    public bool TryBeginSessionChange()
+    {
+        lock (_lock)
+        {
+            if (_sessionChanging || _current is { State: JobState.Running })
+                return false;
+            _sessionChanging = true;
+            return true;
+        }
+    }
+
+    public void EndSessionChange()
+    {
+        lock (_lock)
+            _sessionChanging = false;
+    }
+
+    // Starts a job unless one is already running or the session is being changed. `canStart`, when
+    // given, is evaluated under the admission lock so the caller can confirm the account it captured
+    // is still the current one — closing the window between reading the session and admitting the
+    // job (R3). Returns null if busy, changing, or the guard fails.
+    public Job? TryStart(
+        JobKind kind,
+        string? runId,
+        Func<Job, CancellationToken, Task> work,
+        Func<bool>? canStart = null
+    )
     {
         Job job;
         lock (_lock)
         {
-            if (_current is { State: JobState.Running })
+            if (_sessionChanging || _current is { State: JobState.Running })
+                return null;
+            if (canStart is not null && !canStart())
                 return null;
 
             job = new Job(Guid.NewGuid().ToString("N"), kind, runId);

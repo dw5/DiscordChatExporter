@@ -42,7 +42,7 @@ public sealed class DeletionJob(
             .GetAllMessages()
             .Where(m => planItemIds.Contains(m.Id))
             .Where(m => !m.Keep)
-            .Where(m => m.DeleteStatus is MessageDeleteStatus.None or MessageDeleteStatus.Failed)
+            .Where(m => IsRetryableStatus(m.DeleteStatus))
             .ToArray();
 
         var byChannel = messages.GroupBy(m => m.ChannelId, StringComparer.Ordinal).ToArray();
@@ -75,61 +75,100 @@ public sealed class DeletionJob(
                 .ToArray();
 
             var consecutivePermissionFailures = 0;
-
-            // Bot tokens can bulk-delete recent messages
             var remaining = new List<MessageRecord>(ordered);
-            if (tokenKind == TokenKind.Bot)
+
+            // Bot tokens can bulk-delete recent messages (real runs only). Protected/already-gone
+            // rows are re-checked live just before the request, so a message protected in the
+            // browser mid-run is never deleted.
+            if (tokenKind == TokenKind.Bot && !dryRun)
             {
                 var now = DateTimeOffset.UtcNow;
                 var bulkEligible = remaining
                     .Where(m => now - m.Timestamp < BulkDeleteMaxAge)
                     .ToList();
 
-                foreach (var chunk in Chunk(bulkEligible, 100).Where(c => c.Count >= 2))
+                foreach (var rawChunk in Chunk(bulkEligible, 100))
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    processed += chunk.Count;
 
-                    if (dryRun)
+                    var chunk = rawChunk.Where(IsStillDeletable).ToList();
+                    if (chunk.Count < 2)
+                        continue; // too small to bulk; the singles pass will handle these
+
+                    var stopwatch = Stopwatch.StartNew();
+                    MessageDeletionResult result;
+                    try
                     {
+                        result = await discord.BulkDeleteMessagesAsync(
+                            Snowflake.Parse(channelId),
+                            chunk.Select(m => Snowflake.Parse(m.Id)).ToArray(),
+                            cancellationToken
+                        );
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (DiscordChatExporterException ex) when (ex.IsFatal)
+                    {
+                        job.Log("Fatal error: " + ex.Message);
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        // Recoverable: record and let the singles pass retry this chunk
+                        job.Log($"Bulk delete failed ({ex.Message}); falling back to singles.");
                         foreach (var m in chunk)
-                            await LogAttemptAsync(logPath, m, "bulk", "dry-run");
-                        deleted += chunk.Count;
+                            await LogAttemptAsync(logPath, m, "bulk", "failed");
+                        continue;
+                    }
+                    stopwatch.Stop();
+
+                    if (result.IsSuccess)
+                    {
+                        consecutivePermissionFailures = 0;
+                        foreach (var m in chunk)
+                        {
+                            await manifest.SetMessageDeleteStatusAsync(
+                                m.Id,
+                                MessageDeleteStatus.Deleted,
+                                null
+                            );
+                            await LogAttemptAsync(logPath, m, "bulk", "deleted");
+                            deleted++;
+                            processed++;
+                            remaining.Remove(m);
+                        }
                     }
                     else
                     {
-                        try
-                        {
-                            var result = await discord.BulkDeleteMessagesAsync(
-                                Snowflake.Parse(channelId),
-                                chunk.Select(m => Snowflake.Parse(m.Id)).ToArray(),
-                                cancellationToken
-                            );
+                        foreach (var m in chunk)
+                            await LogAttemptAsync(logPath, m, "bulk", "failed");
+                        // leave in remaining for the singles pass
 
-                            if (result.IsSuccess)
-                            {
-                                foreach (var m in chunk)
-                                {
-                                    await manifest.SetMessageDeleteStatusAsync(
-                                        m.Id,
-                                        MessageDeleteStatus.Deleted,
-                                        null
-                                    );
-                                    await LogAttemptAsync(logPath, m, "bulk", "deleted");
-                                }
-                                deleted += chunk.Count;
-                                foreach (var m in chunk)
-                                    remaining.Remove(m);
-                            }
-                        }
-                        catch (Exception ex)
+                        // A permission failure won't fix itself for the rest of the channel, so stop
+                        // firing bulk requests and let the singles pass hit the channel threshold.
+                        if (
+                            result.Outcome
+                            is MessageDeletionOutcome.MissingPermissions
+                                or MessageDeletionOutcome.MissingAccess
+                        )
                         {
-                            // Fall back to single deletes for this chunk
-                            job.Log($"Bulk delete failed ({ex.Message}); falling back.");
+                            consecutivePermissionFailures++;
+                            break;
                         }
                     }
 
-                    job.ReportProgress((double)processed / Math.Max(1, total));
+                    job.ReportProgress(
+                        (double)processed / Math.Max(1, total),
+                        $"{deleted} deleted, {skipped} skipped"
+                    );
+
+                    // Pace bulk requests the same way as singles: back off after a slow/rate-limited
+                    // call so a zero-baseline bot token still slows down under pressure.
+                    var bulkDelay = pacer.NextDelay(stopwatch.Elapsed);
+                    if (bulkDelay > TimeSpan.Zero)
+                        await Task.Delay(bulkDelay, cancellationToken);
                 }
             }
 
@@ -148,8 +187,18 @@ public sealed class DeletionJob(
                             "Repeated permission failures"
                         );
                         skipped++;
+                        processed++;
                     }
                     break;
+                }
+
+                // Re-check live state so a message protected (or already deleted) since the plan
+                // was built is never touched (R2).
+                if (!IsStillDeletable(message))
+                {
+                    skipped++;
+                    processed++;
+                    continue;
                 }
 
                 processed++;
@@ -226,6 +275,23 @@ public sealed class DeletionJob(
                 : $"Done. {deleted} deleted, {skipped} skipped."
         );
     }
+
+    // Re-reads a message's live row so protections or prior deletions made after planning win.
+    private bool IsStillDeletable(MessageRecord message)
+    {
+        var live = manifest.GetMessage(message.Id);
+        return live is not null && !live.Keep && IsRetryableStatus(live.DeleteStatus);
+    }
+
+    // The statuses the planner also counts as candidates, so preview and execution never disagree:
+    // never-tried, a prior soft failure, or a transient skip that can succeed once the cause (a
+    // missing permission or an archived thread) is fixed. Deleted/Gone/NotDeletable are terminal.
+    private static bool IsRetryableStatus(MessageDeleteStatus status) =>
+        status
+            is MessageDeleteStatus.None
+                or MessageDeleteStatus.Failed
+                or MessageDeleteStatus.SkippedNoPermission
+                or MessageDeleteStatus.SkippedArchivedThread;
 
     private static (MessageDeleteStatus, string) MapOutcome(MessageDeletionOutcome outcome) =>
         outcome switch

@@ -125,6 +125,21 @@ public sealed class GuildExportJob(
         var completed = 0;
         var total = exportable.Length;
 
+        // ExportRequest treats its output/assets paths as templates (%g, %c, …). Our run directory
+        // is a literal path that can contain a '%' from the guild name, so escape it to '%%' or the
+        // export would write into a different folder than the manifest and /files use (R5).
+        var outputBase = runDir.Replace("%", "%%") + Path.DirectorySeparatorChar;
+        var mediaBase =
+            Path.Combine(runDir, "media").Replace("%", "%%") + Path.DirectorySeparatorChar;
+
+        // Every failed asset URL (attachment or not), collected across the parallel channel exports
+        // for the portable summary.json written at the end.
+        var failedAssets = new System.Collections.Concurrent.ConcurrentBag<(
+            string ChannelId,
+            string Url,
+            bool IsAttachment
+        )>();
+
         await Parallel.ForEachAsync(
             exportable,
             new ParallelOptions
@@ -144,8 +159,8 @@ public sealed class GuildExportJob(
                         .Formats.Select(format => new ExportRequest(
                             guild,
                             channel,
-                            runDir + Path.DirectorySeparatorChar,
-                            Path.Combine(runDir, "media") + Path.DirectorySeparatorChar,
+                            outputBase,
+                            mediaBase,
                             format,
                             null,
                             null,
@@ -182,7 +197,11 @@ public sealed class GuildExportJob(
 
                     foreach (var url in result.FailedAssetUrls)
                     {
-                        if (ExportAssetDownloader.IsDiscordAttachmentUrl(url))
+                        var isAttachment = ExportAssetDownloader.IsDiscordAttachmentUrl(url);
+                        // Record every failed asset for summary.json, not just attachments, so
+                        // avatar/emoji/embed-thumbnail failures leave a diagnostic trail (R8).
+                        failedAssets.Add((channelId, url, isAttachment));
+                        if (isAttachment)
                         {
                             await manifest.RecordFailedAssetAsync(
                                 attachmentMessageByUrl.GetValueOrDefault(url, ""),
@@ -248,17 +267,91 @@ public sealed class GuildExportJob(
 
         await manifest.SetFinishedAsync(DateTimeOffset.UtcNow);
         await manifest.FlushAsync();
+        await WriteSummaryAsync(runId, runDir, guild, manifest, failedAssets, job);
         job.Log("Export complete.");
         return runId;
+    }
+
+    // Writes a portable per-channel status + failed-asset snapshot next to the export, so the run is
+    // diagnosable without the SQLite manifest. Best-effort: a write failure never fails the export.
+    private static async Task WriteSummaryAsync(
+        string runId,
+        string runDir,
+        Guild guild,
+        ManifestStore manifest,
+        IEnumerable<(string ChannelId, string Url, bool IsAttachment)> failedAssets,
+        Job job
+    )
+    {
+        try
+        {
+            var channels = manifest.GetChannels();
+            var summary = new
+            {
+                runId,
+                guild = new { id = guild.Id.ToString(), name = guild.Name },
+                generatedAt = DateTimeOffset.UtcNow,
+                channels = channels
+                    .Select(c => new
+                    {
+                        id = c.Id,
+                        name = c.HierarchicalName,
+                        status = c.Status.ToString(),
+                        messageCount = c.MessageCount,
+                        failedAttachmentCount = c.FailedAttachmentCount,
+                        error = c.Error,
+                    })
+                    .ToArray(),
+                failedAssets = failedAssets
+                    .GroupBy(f => f.Url, StringComparer.Ordinal)
+                    .Select(g => new
+                    {
+                        url = g.Key,
+                        channelId = g.First().ChannelId,
+                        isAttachment = g.First().IsAttachment,
+                    })
+                    .ToArray(),
+            };
+
+            var json = System.Text.Json.JsonSerializer.Serialize(
+                summary,
+                new System.Text.Json.JsonSerializerOptions { WriteIndented = true }
+            );
+            await File.WriteAllTextAsync(Path.Combine(runDir, "summary.json"), json);
+        }
+        catch (Exception ex)
+        {
+            job.Log("Could not write summary.json: " + ex.Message);
+        }
     }
 
     // Returns false if the message was skipped (not recorded).
     private static bool WriteMessage(ManifestStore manifest, Channel channel, Message message)
     {
-        // The thread starter message is rendered by the parent channel's export with the same ID;
-        // skip it here so it isn't double-counted or deleted through the thread.
-        if (channel.IsThread && !channel.IsThreadContainer && message.Id == channel.Id)
+        // A regular thread's starter message has the same ID as the thread and is also exported by
+        // the parent channel, so skip it here to avoid double-counting. But a forum/media post's
+        // starter has that same ID while its container is NOT exported, so it must be kept.
+        if (
+            channel.IsThread
+            && channel.Parent is { IsThreadContainer: false }
+            && message.Id == channel.Id
+        )
+        {
             return false;
+        }
+
+        var attachments = message.Attachments.Select(ToAttachmentRecord).ToList();
+
+        var stickers =
+            message.Stickers.Count == 0 ? null : message.Stickers.Select(ToStickerRecord).ToList();
+
+        var forwarded = message.ForwardedMessage is { } fwd
+            ? new ForwardedRecord(
+                fwd.Content,
+                fwd.Stickers.Select(ToStickerRecord).ToList(),
+                fwd.Attachments.Select(ToAttachmentRecord).ToList()
+            )
+            : null;
 
         manifest.EnqueueMessage(
             new MessageRecord(
@@ -273,10 +366,29 @@ public sealed class GuildExportJob(
                 message.Attachments.Count,
                 message.Embeds.Count,
                 false,
-                MessageDeleteStatus.None
+                MessageDeleteStatus.None,
+                attachments,
+                message.Author.AvatarUrl,
+                stickers,
+                forwarded
             )
         );
 
         return true;
     }
+
+    private static AttachmentRecord ToAttachmentRecord(Attachment a) =>
+        new(
+            a.FileName,
+            // The deterministic name the exporter writes into media/, so the UI can load it.
+            ExportAssetDownloader.GetTargetFileName(a.Url),
+            a.Url,
+            a.IsImage ? "image"
+                : a.IsVideo ? "video"
+                : a.IsAudio ? "audio"
+                : "file",
+            a.IsSpoiler
+        );
+
+    private static StickerRecord ToStickerRecord(Sticker s) => new(s.Name, s.SourceUrl, s.IsImage);
 }

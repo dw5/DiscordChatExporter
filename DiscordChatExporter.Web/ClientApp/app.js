@@ -389,73 +389,325 @@ async function showRun(runId) {
   chanCard.append(tbl);
   view.append(chanCard);
 
-  view.append(messageBrowserCard(runId, data.channels));
+  view.append(messageBrowserCard(runId, run.guildId, data.channels));
   view.append(deletionCard(runId, run, data.channels));
   render(view);
 }
 
-// ---- message browser: click to protect individual messages ---------------------------------
+// ---- message browser: full-screen Discord-style reader to protect messages -----------------
 
-function messageBrowserCard(runId, channels) {
+const AUTHOR_COLORS = ["#e67e22", "#3498db", "#9b59b6", "#e74c3c", "#1abc9c", "#f1c40f", "#2ecc71", "#eb459e", "#00b894", "#5865f2"];
+function authorColor(name) {
+  let h = 0;
+  for (const ch of name || "?") h = (h * 31 + ch.charCodeAt(0)) >>> 0;
+  return AUTHOR_COLORS[h % AUTHOR_COLORS.length];
+}
+function initialsOf(name) {
+  return (name || "?").trim().charAt(0).toUpperCase() || "?";
+}
+function fmtTime(ts) {
+  const d = new Date(ts);
+  return d.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+}
+
+// Renders a safe subset of Discord markdown to HTML. Everything is HTML-escaped first, so only the
+// fixed whitelist of tags emitted below can ever reach the DOM — no raw user HTML, no scripts.
+function renderContent(raw) {
+  let s = escapeHtml(raw);
+
+  // Stash code spans so inner markdown/URLs aren't reformatted.
+  const stash = [];
+  const keep = (html) => {
+    stash.push(html);
+    return "\u0000" + (stash.length - 1) + "\u0000";
+  };
+  s = s.replace(/```(?:[a-zA-Z0-9_+-]*\n)?([\s\S]*?)```/g, (_, code) => keep(`<pre class="dc-code">${code.replace(/\n$/, "")}</pre>`));
+  s = s.replace(/`([^`\n]+?)`/g, (_, code) => keep(`<code class="dc-inline">${code}</code>`));
+
+  // Links [text](url) and bare URLs — http/https only.
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, text, url) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${text}</a>`);
+  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<]+)/g, (_, pre, url) => `${pre}<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`);
+
+  // Emphasis.
+  s = s.replace(/\*\*([^*]+?)\*\*/g, "<strong>$1</strong>");
+  s = s.replace(/__([^_]+?)__/g, "<u>$1</u>");
+  s = s.replace(/~~([^~]+?)~~/g, "<del>$1</del>");
+  s = s.replace(/\*([^*\n]+?)\*/g, "<em>$1</em>");
+  s = s.replace(/(^|[^a-zA-Z0-9_])_([^_\n]+?)_(?![a-zA-Z0-9_])/g, "$1<em>$2</em>");
+
+  // Discord entities (<@id>, <#id>, <@&id>, <:name:id>) → readable text.
+  s = s.replace(/&lt;a?:(\w+):\d+&gt;/g, ":$1:");
+  s = s.replace(/&lt;@!?(\d+)&gt;/g, "@mention");
+  s = s.replace(/&lt;@&amp;\d+&gt;/g, "@role");
+  s = s.replace(/&lt;#\d+&gt;/g, "#channel");
+
+  return s.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[+i]);
+}
+
+// The card on the run page is just an entry point; the reader itself is a full-screen overlay.
+function messageBrowserCard(runId, guildId, channels) {
+  const open = el("button", {}, "Browse & protect messages");
+  open.addEventListener("click", () => openMessageBrowser(runId, guildId, channels));
+  return el(
+    "div",
+    { class: "card" },
+    el("h2", {}, "Browse & protect messages"),
+    el("p", { class: "muted" }, "Open a full-screen reader that looks like Discord. Click the shield on any message to protect it from deletion — no copying IDs. Protected messages are kept no matter what the delete filters say."),
+    el("div", { style: "margin-top:12px" }, open),
+  );
+}
+
+function openMessageBrowser(runId, guildId, channels) {
   const myId = state.session.user.id;
   const channelName = Object.fromEntries(channels.map((c) => [c.id, c.name]));
 
-  const channelSel = el("select", {}, el("option", { value: "" }, "All channels"), ...channels.map((c) => el("option", { value: c.id }, c.name)));
-  const search = el("input", { type: "search", placeholder: "Search message text…" });
+  // --- sidebar: channel picker ---
+  const chanList = el("div", { class: "dc-channels" });
+  let currentChannel = ""; // "" = all channels
+  const chanButtons = {};
+
+  const makeChanBtn = (id, label) => {
+    const b = el("div", { class: "dc-channel" + (id === currentChannel ? " active" : "") }, el("span", { class: "dc-hash" }, id ? "#" : "✳"), el("span", {}, label));
+    b.addEventListener("click", () => {
+      currentChannel = id;
+      for (const [cid, btn] of Object.entries(chanButtons)) btn.classList.toggle("active", cid === id);
+      titleEl.textContent = id ? "#" + (channels.find((c) => c.id === id)?.name || "") : "All channels";
+      load(true);
+    });
+    chanButtons[id] = b;
+    return b;
+  };
+  // Only channels that actually have backed-up messages are worth browsing.
+  const activeChannels = channels.filter((c) => (c.messageCount || 0) > 0);
+  chanList.append(makeChanBtn("", "All channels"));
+  for (const c of activeChannels) chanList.append(makeChanBtn(c.id, c.name));
+
+  const sidebar = el("div", { class: "dc-sidebar" }, el("div", { class: "dc-sidebar-head" }, "Channels"), chanList);
+
+  // --- top bar ---
+  const titleEl = el("div", { class: "dc-title" }, "All channels");
+  const search = el("input", { type: "search", placeholder: "Search messages…" });
   const onlyMine = el("input", { type: "checkbox" });
   const keptOnly = el("input", { type: "checkbox" });
-  const loadBtn = el("button", { class: "secondary" }, "Search");
-  const moreBtn = el("button", { class: "secondary hidden" }, "Load more");
-  const info = el("div", { class: "muted small" });
+  const keptCounter = el("span", { class: "dc-kept muted small" }, "");
+  const closeBtn = el("button", { class: "secondary" }, "✕ Close");
 
-  const tbl = el("table", {}, el("tr", {}, el("th", {}, "Protect"), el("th", {}, "Author"), el("th", {}, "When"), el("th", {}, "Channel"), el("th", {}, "Message")));
-  const body = el("tbody", {});
-  tbl.append(body);
+  const controls = el(
+    "div",
+    { class: "dc-controls" },
+    search,
+    el("label", { class: "dc-toggle" }, onlyMine, "Only mine"),
+    el("label", { class: "dc-toggle" }, keptOnly, "Only protected"),
+    keptCounter,
+  );
+  const topbar = el("div", { class: "dc-topbar" }, titleEl, el("div", { class: "spacer" }), controls, closeBtn);
+
+  // --- message pane ---
+  const pane = el("div", { class: "dc-messages" });
+  const info = el("div", { class: "dc-info muted small" }, "Loading…");
+  const moreBtn = el("button", { class: "secondary hidden" }, "Load older");
+  const paneWrap = el("div", { class: "dc-pane" }, pane, el("div", { class: "dc-foot" }, info, moreBtn));
+
+  const main = el("div", { class: "dc-main" }, topbar, paneWrap);
+  const overlay = el("div", { class: "modal-overlay" }, el("div", { class: "modal dc-modal" }, sidebar, main));
 
   let cursor = 0;
+  let lastGroup = null; // { author, time }
 
-  function row(m) {
-    const cb = el("input", { type: "checkbox", title: "Protect this message from deletion" });
-    cb.checked = m.keep;
-    cb.addEventListener("change", async () => {
-      cb.disabled = true;
-      try {
-        await api.put(`/api/exports/${runId}/messages/${m.id}/keep`, { keep: cb.checked });
-      } catch (e) {
-        alert(e.message);
-        cb.checked = !cb.checked;
-      }
-      cb.disabled = false;
-    });
-    const when = new Date(m.timestamp).toLocaleString();
-    const deleted = m.deleteStatus === "Deleted" || m.deleteStatus === "Gone";
-    return el(
-      "tr",
-      { class: deleted ? "struck" : "" },
-      el("td", {}, cb),
-      el("td", {}, m.authorName + (m.isPinned ? " 📌" : "")),
-      el("td", { class: "small nowrap" }, when),
-      el("td", { class: "small" }, channelName[m.channelId] || ""),
-      el("td", { class: "msg-content" }, m.content || el("span", { class: "muted" }, "(no text)")),
-    );
+  const close = () => {
+    document.removeEventListener("keydown", onKey);
+    overlay.remove();
+  };
+  const onKey = (e) => e.key === "Escape" && close();
+  closeBtn.addEventListener("click", close);
+  overlay.addEventListener("click", (e) => e.target === overlay && close());
+  document.addEventListener("keydown", onKey);
+
+  // Profile picture, falling back to a colored initial if there's no avatar or it fails to load.
+  function avatarEl(m) {
+    const fallback = el("div", { class: "dc-avatar", style: `background:${authorColor(m.authorName)}` }, initialsOf(m.authorName));
+    if (!m.authorAvatarUrl) return fallback;
+    const img = el("img", { class: "dc-avatar", src: m.authorAvatarUrl, loading: "lazy", alt: m.authorName });
+    img.addEventListener("error", () => img.replaceWith(fallback));
+    return img;
   }
+
+  // Renders one attachment: the backed-up local file if present, falling back to the (expiring)
+  // Discord CDN url if the file wasn't downloaded. Images/video/audio play inline; anything else
+  // is a download link. Spoilers are blurred until clicked.
+  function attachmentEl(a) {
+    const localSrc = `/files/${runId}/media/${encodeURIComponent(a.localName)}`;
+    const wrap = el("div", { class: "dc-att" + (a.isSpoiler ? " spoiler" : "") });
+    const onErr = (node) => node.addEventListener("error", () => {
+      if (a.url && node.getAttribute("src") !== a.url) node.setAttribute("src", a.url);
+    });
+
+    if (a.kind === "image") {
+      const img = el("img", { class: "dc-att-img", src: localSrc, loading: "lazy", alt: a.fileName });
+      onErr(img);
+      wrap.append(el("a", { href: localSrc, target: "_blank", rel: "noopener noreferrer" }, img));
+    } else if (a.kind === "video") {
+      const v = el("video", { class: "dc-att-img", src: localSrc, controls: true, preload: "metadata" });
+      onErr(v);
+      wrap.append(v);
+    } else if (a.kind === "audio") {
+      const au = el("audio", { src: localSrc, controls: true, preload: "metadata" });
+      onErr(au);
+      wrap.append(au);
+    } else {
+      wrap.append(el("a", { class: "dc-att-file", href: localSrc, target: "_blank", rel: "noopener noreferrer", download: a.fileName }, "📄 " + a.fileName));
+    }
+
+    if (a.isSpoiler) wrap.addEventListener("click", () => wrap.classList.remove("spoiler"), { once: true });
+    return wrap;
+  }
+
+  // A sticker renders as its image straight from Discord's public (non-expiring) sticker CDN.
+  // Lottie stickers are JSON-animated with no static image, so they show as a labelled chip.
+  function stickerEl(s) {
+    const wrap = el("div", { class: "dc-att dc-sticker" });
+    if (s.isImage) {
+      wrap.append(el("img", { class: "dc-sticker-img", src: s.url, loading: "lazy", alt: s.name, title: s.name }));
+    } else {
+      wrap.append(el("span", { class: "dc-att-file" }, "🏷 " + s.name + " (animated sticker)"));
+    }
+    return wrap;
+  }
+
+  // A forwarded message shown as a quoted block with its own text, stickers and attachments.
+  function forwardedEl(f) {
+    const kids = [el("div", { class: "dc-fwd-label" }, "➦ Forwarded")];
+    const t = (f.content || "").trim();
+    if (t) kids.push(el("div", { class: "dc-text", html: renderContent(f.content) }));
+    const fs = f.stickers || [];
+    if (fs.length) {
+      const row = el("div", { class: "dc-media" });
+      for (const s of fs) row.append(stickerEl(s));
+      kids.push(row);
+    }
+    const fa = f.attachments || [];
+    if (fa.length) {
+      const grid = el("div", { class: "dc-media" });
+      for (const a of fa) grid.append(attachmentEl(a));
+      kids.push(grid);
+    }
+    if (!t && !fs.length && !fa.length) kids.push(el("div", { class: "dc-text muted" }, "(no content)"));
+    return el("div", { class: "dc-fwd" }, ...kids);
+  }
+
+  function renderMessage(m) {
+    // Grouping also breaks on a channel change, so the "All channels" view never merges messages
+    // from different channels under one header.
+    const sameGroup =
+      lastGroup &&
+      lastGroup.author === m.authorId &&
+      lastGroup.channel === m.channelId &&
+      new Date(m.timestamp) - lastGroup.time < 7 * 60 * 1000;
+    lastGroup = { author: m.authorId, channel: m.channelId, time: new Date(m.timestamp) };
+
+    const deleted = m.deleteStatus === "Deleted" || m.deleteStatus === "Gone";
+    const msg = el("div", { class: "dc-msg" + (sameGroup ? " grouped" : "") + (m.keep ? " protected" : "") + (deleted ? " deleted" : "") });
+
+    const gutter = sameGroup
+      ? el("div", { class: "dc-gutter dc-ts-hover" }, new Date(m.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))
+      : el("div", { class: "dc-gutter" }, avatarEl(m));
+
+    const bodyKids = [];
+    if (!sameGroup) {
+      bodyKids.push(
+        el(
+          "div",
+          { class: "dc-head" },
+          el("span", { class: "dc-author", style: `color:${authorColor(m.authorName)}` }, m.authorName),
+          el("span", { class: "dc-ts" }, fmtTime(m.timestamp)),
+          // In the all-channels view, say which channel this message is in.
+          !currentChannel ? el("span", { class: "dc-chan-tag" }, "#" + (channelName[m.channelId] || "")) : null,
+          m.isPinned ? el("span", { class: "dc-pin", title: "Pinned" }, "📌") : null,
+        ),
+      );
+    }
+    const text = (m.content || "").trim();
+    if (text) {
+      bodyKids.push(el("div", { class: "dc-text", html: renderContent(m.content) }));
+    }
+    const stickers = m.stickers || [];
+    if (stickers.length) {
+      const row = el("div", { class: "dc-media" });
+      for (const s of stickers) row.append(stickerEl(s));
+      bodyKids.push(row);
+    }
+    const atts = m.attachments || [];
+    if (atts.length) {
+      const grid = el("div", { class: "dc-media" });
+      for (const a of atts) grid.append(attachmentEl(a));
+      bodyKids.push(grid);
+    } else if (m.attachmentCount) {
+      // Older exports (before attachments were recorded) only know the count. Re-export to see them.
+      bodyKids.push(el("div", { class: "dc-attach muted small" }, `📎 ${m.attachmentCount} attachment${m.attachmentCount > 1 ? "s" : ""} — re-export to view`));
+    }
+    // A forwarded message carries its own text/stickers/attachments but no author of its own.
+    if (m.forwarded) bodyKids.push(forwardedEl(m.forwarded));
+    if (m.embedCount) bodyKids.push(el("div", { class: "dc-attach muted small" }, `🔗 ${m.embedCount} embed${m.embedCount > 1 ? "s" : ""}`));
+    // Only fall back to "(no text)" when nothing at all was rendered for this message.
+    const hasAnything = text || stickers.length || atts.length || m.attachmentCount || m.forwarded || m.embedCount;
+    if (!hasAnything) bodyKids.push(el("div", { class: "dc-text muted" }, "(no text)"));
+    if (deleted) bodyKids.push(el("div", { class: "dc-attach muted small" }, "already deleted"));
+
+    const body = el("div", { class: "dc-body" }, ...bodyKids);
+
+    const shield = el("button", { class: "dc-shield" + (m.keep ? " on" : ""), title: m.keep ? "Protected — click to unprotect" : "Protect from deletion" }, "🛡");
+    shield.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const next = !m.keep;
+      shield.disabled = true;
+      try {
+        await api.put(`/api/exports/${runId}/messages/${m.id}/keep`, { keep: next });
+        m.keep = next;
+        msg.classList.toggle("protected", next);
+        shield.classList.toggle("on", next);
+        shield.title = next ? "Protected — click to unprotect" : "Protect from deletion";
+        keptCount += next ? 1 : -1;
+        updateKeptCounter();
+      } catch (err) {
+        alert(err.message);
+      }
+      shield.disabled = false;
+    });
+
+    // Jump to the live message on Discord for context before deciding to keep or delete it.
+    const discordUrl = guildId ? `https://discord.com/channels/${guildId}/${m.channelId}/${m.id}` : null;
+    const actions = [shield];
+    if (discordUrl) actions.push(el("a", { class: "dc-open", href: discordUrl, target: "_blank", rel: "noopener noreferrer", title: "Open in Discord" }, "↗"));
+
+    msg.append(gutter, body, el("div", { class: "dc-actions" }, ...actions));
+    return msg;
+  }
+
+  let keptCount = 0;
+  const updateKeptCounter = () => (keptCounter.textContent = keptCount ? `${keptCount} protected` : "");
 
   async function load(reset) {
     if (reset) {
       cursor = 0;
-      clear(body);
+      lastGroup = null;
+      clear(pane);
+      info.textContent = "Loading…";
     }
-    loadBtn.disabled = true;
+    moreBtn.disabled = true;
     try {
       const params = new URLSearchParams();
-      if (channelSel.value) params.set("channel", channelSel.value);
+      if (currentChannel) params.set("channel", currentChannel);
       if (search.value.trim()) params.set("q", search.value.trim());
       if (onlyMine.checked) params.set("author", myId);
       if (keptOnly.checked) params.set("keep", "true");
       params.set("cursor", cursor);
       const res = await api.get(`/api/exports/${runId}/messages?` + params.toString());
-      for (const m of res.items) body.append(row(m));
-      info.textContent = `${res.total} message(s) match`;
+      for (const m of res.items) pane.append(renderMessage(m));
+      info.textContent = res.total ? `${res.total} message(s) match` : "No messages match.";
       if (res.nextCursor >= 0) {
         cursor = res.nextCursor;
         moreBtn.classList.remove("hidden");
@@ -465,24 +717,33 @@ function messageBrowserCard(runId, channels) {
     } catch (e) {
       info.textContent = e.message;
     }
-    loadBtn.disabled = false;
+    moreBtn.disabled = false;
   }
 
-  loadBtn.addEventListener("click", () => load(true));
-  moreBtn.addEventListener("click", () => load(false));
-  search.addEventListener("keydown", (e) => e.key === "Enter" && load(true));
+  // Live protected count across the whole export (independent of current filter).
+  async function refreshKeptCount() {
+    try {
+      const res = await api.get(`/api/exports/${runId}/messages?keep=true&cursor=0`);
+      keptCount = res.total || 0;
+      updateKeptCounter();
+    } catch {}
+  }
 
-  return el(
-    "div",
-    { class: "card" },
-    el("h2", {}, "Browse & protect messages"),
-    el("p", { class: "muted" }, "Tick a message to protect it from deletion — no need to copy IDs. Protected messages are kept no matter what the delete filters say."),
-    el("div", { class: "row" }, channelSel, search),
-    el("div", { style: "display:flex; gap:18px; align-items:center; margin:8px 0" }, el("div", { class: "check tight" }, onlyMine, el("label", {}, "Only my messages")), el("div", { class: "check tight" }, keptOnly, el("label", {}, "Only protected")), loadBtn),
-    info,
-    tbl,
-    el("div", { style: "margin-top:10px" }, moreBtn),
-  );
+  let searchTimer;
+  search.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => load(true), 250);
+  });
+  onlyMine.addEventListener("change", () => load(true));
+  keptOnly.addEventListener("change", () => load(true));
+  moreBtn.addEventListener("click", () => load(false));
+  pane.addEventListener("scroll", () => {
+    if (!moreBtn.classList.contains("hidden") && !moreBtn.disabled && pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 200) load(false);
+  });
+
+  document.body.append(overlay);
+  refreshKeptCount();
+  load(true);
 }
 
 function deletionCard(runId, run, channels) {
@@ -526,7 +787,9 @@ function deletionCard(runId, run, channels) {
       keepWithAttachments: keepAttach.checked,
       allowIncompleteMedia: allowMedia.checked,
       keepIfContains: keepContains.value.split(",").map((s) => s.trim()).filter(Boolean),
-      excludedMessageIds: excludeMsgs.value.split("\n").map((s) => s.trim()).filter(Boolean).map(parseRef).filter(Boolean),
+      // Send raw, nonblank references so the server validates them and rejects anything unreadable
+      // visibly — never silently drop a line the user meant as protection.
+      excludedMessageIds: excludeMsgs.value.split("\n").map((s) => s.trim()).filter(Boolean),
       excludedChannelIds: Object.entries(channelChecks).filter(([, cb]) => cb.checked).map(([id]) => id),
     };
   }
@@ -589,18 +852,49 @@ function renderPreview(runId, run, p) {
     wrap.append(el("div", { class: "banner danger" }, `This export was made by a different account. You are signed in as ${p.deletingUser.name}; under "only my own", only that account's messages are affected.`));
   }
 
-  wrap.append(el("div", { class: "stat-row" }, el("div", {}, el("div", { class: "stat" }, String(p.totalCandidates)), el("div", { class: "muted" }, "would be deleted")), el("div", {}, el("div", { class: "stat" }, String(p.totalKept)), el("div", { class: "muted" }, "protected by your rules"))));
+  wrap.append(el("div", { class: "stat-row" }, el("div", {}, el("div", { class: "stat" }, String(p.totalCandidates)), el("div", { class: "muted" }, "would be deleted")), el("div", {}, el("div", { class: "stat" }, String(p.totalKept)), el("div", { class: "muted" }, "protected / kept"))));
 
   if (p.totalCandidates === 0) {
     wrap.append(el("div", { class: "banner warn" }, "Nothing matches — adjust the filters above."));
     return wrap;
   }
 
-  const perChan = el("table", {}, el("tr", {}, el("th", {}, "Channel"), el("th", {}, "To delete"), el("th", {}, "Protected")));
-  for (const c of p.channels) perChan.append(el("tr", {}, el("td", {}, c.channelName), el("td", {}, String(c.candidateCount)), el("td", {}, String(c.keptCount))));
-  wrap.append(perChan);
+  // What will be gone, and from where: per-channel counts with a few example messages.
+  const samplesByChannel = Object.fromEntries((p.samples || []).map((s) => [s.channelId, s]));
+  wrap.append(el("p", { class: "muted small" }, "These messages will be permanently deleted from Discord. Review by channel below — protect anything you want to keep in “Browse & protect messages” first."));
 
-  const confirm = el("input", { type: "text", placeholder: `type "${run.guildName}" to confirm` });
+  const list = el("div", { class: "del-list" });
+  const channelsToShow = p.channels.filter((c) => c.candidateCount > 0).sort((a, b) => b.candidateCount - a.candidateCount);
+  for (const c of channelsToShow) {
+    const s = samplesByChannel[c.id] || samplesByChannel[c.channelId];
+    const head = el(
+      "div",
+      { class: "del-chan-head" },
+      el("span", { class: "del-chan-name" }, "#" + c.channelName),
+      el("span", { class: "pill err" }, `${c.candidateCount} to delete`),
+      c.keptCount ? el("span", { class: "pill muted" }, `${c.keptCount} kept`) : null,
+    );
+    const samples = el("div", { class: "del-samples" });
+    if (s && s.sample) {
+      for (const m of s.sample) {
+        samples.append(
+          el(
+            "div",
+            { class: "del-sample" },
+            el("span", { class: "del-sample-author", style: `color:${authorColor(m.authorName)}` }, m.authorName),
+            el("span", { class: "del-sample-ts muted small" }, fmtTime(m.timestamp)),
+            el("span", { class: "del-sample-text" }, m.content || el("span", { class: "muted" }, "(no text)")),
+          ),
+        );
+      }
+      if (c.candidateCount > s.sample.length) samples.append(el("div", { class: "muted small del-more" }, `…and ${c.candidateCount - s.sample.length} more in #${c.channelName}`));
+    }
+    list.append(el("div", { class: "del-chan" }, head, samples));
+  }
+  wrap.append(list);
+
+  const needsUser = p.accountMismatch;
+  const confirm = el("input", { type: "text", placeholder: `type ${JSON.stringify(p.confirmText || run.guildName)} to confirm` });
   const dryRun = el("input", { type: "checkbox", checked: true });
   const go = el("button", { class: "danger" }, "Delete");
 
@@ -617,7 +911,7 @@ function renderPreview(runId, run, p) {
 
   wrap.append(
     el("div", { class: "check", style: "margin-top:12px" }, dryRun, el("label", {}, el("strong", {}, "Dry run"), " — count only, delete nothing")),
-    el("label", {}, "Confirm server name"),
+    el("label", {}, needsUser ? "Confirm server name and your username" : "Confirm server name"),
     confirm,
     el("div", { style: "margin-top:10px" }, go),
   );

@@ -12,7 +12,10 @@ namespace DiscordChatExporter.Web.Services;
 // Owns the data directory and the per-run export folders, and keeps one ManifestStore open per run.
 public sealed class RunRegistry : IAsyncDisposable
 {
-    private readonly ConcurrentDictionary<string, ManifestStore> _stores = new(
+    // Lazy values so the store for a given database is constructed exactly once even under
+    // concurrent opens — ConcurrentDictionary.GetOrAdd can otherwise run its factory more than once,
+    // which here would start multiple background writers on the same file (R1).
+    private readonly ConcurrentDictionary<string, Lazy<ManifestStore>> _stores = new(
         StringComparer.Ordinal
     );
 
@@ -40,7 +43,10 @@ public sealed class RunRegistry : IAsyncDisposable
         var guildFolder = Path.Combine(ExportsDir, Sanitize($"{guildName} [{guildId}]"));
         Directory.CreateDirectory(guildFolder);
 
-        while (true)
+        // Try a bounded number of fresh ids. We reject ANY pre-existing path (even an empty dir) so
+        // a new export can never land on an old backup, and we let real I/O errors (disk full,
+        // permissions) propagate instead of spinning forever (R5).
+        for (var attempt = 0; attempt < 1000; attempt++)
         {
             var runId =
                 DateTimeOffset.Now.ToString("yyyy-MM-dd_HHmmss", CultureInfo.InvariantCulture)
@@ -48,25 +54,22 @@ public sealed class RunRegistry : IAsyncDisposable
                 + Convert.ToHexStringLower(Guid.NewGuid().ToByteArray().AsSpan(0, 4));
 
             var dir = Path.Combine(guildFolder, runId);
-            try
-            {
-                // Fails if the directory already exists, guaranteeing we never reuse one
-                Directory.CreateDirectory(dir);
-                if (Directory.EnumerateFileSystemEntries(dir).Any())
-                    continue;
-                return (runId, dir);
-            }
-            catch (IOException)
-            {
-                // Collision (extremely unlikely); try another id
-            }
+            if (Directory.Exists(dir) || File.Exists(dir))
+                continue; // id collision — try another
+
+            Directory.CreateDirectory(dir);
+            return (runId, dir);
         }
+
+        throw new IOException("Could not allocate a unique run directory after many attempts.");
     }
 
     public ManifestStore OpenManifest(string runDir)
     {
         var dbPath = Path.Combine(runDir, "manifest.db");
-        return _stores.GetOrAdd(dbPath, ManifestStore.Create);
+        return _stores
+            .GetOrAdd(dbPath, p => new Lazy<ManifestStore>(() => ManifestStore.Create(p)))
+            .Value;
     }
 
     // Finds a run directory by its id across all guild folders.
@@ -123,8 +126,9 @@ public sealed class RunRegistry : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        foreach (var store in _stores.Values)
-            await store.DisposeAsync();
+        foreach (var lazy in _stores.Values)
+            if (lazy.IsValueCreated)
+                await lazy.Value.DisposeAsync();
         _stores.Clear();
     }
 }

@@ -21,6 +21,65 @@ public class PlanAndCriteriaTests
         DeletionCriteria.ParseMessageReference(input).Should().BeNull();
 
     [Fact]
+    public void Validate_rejects_an_unparseable_date_boundary()
+    {
+        // A typo must never silently become "no boundary" and widen the deletion (R1).
+        new DeletionCriteria { OnlyBefore = "2026-99-01" }
+            .Validate()
+            .Should()
+            .NotBeNull();
+        new DeletionCriteria { OnlyAfter = "garbage" }
+            .Validate()
+            .Should()
+            .NotBeNull();
+    }
+
+    [Fact]
+    public void Validate_rejects_a_reversed_range()
+    {
+        new DeletionCriteria { OnlyAfter = "2026-02-01", OnlyBefore = "2026-01-01" }
+            .Validate()
+            .Should()
+            .NotBeNull();
+    }
+
+    [Fact]
+    public void Validate_accepts_empty_and_valid_boundaries()
+    {
+        new DeletionCriteria().Validate().Should().BeNull();
+        new DeletionCriteria { OnlyAfter = "2026-01-01", OnlyBefore = "2026-02-01" }
+            .Validate()
+            .Should()
+            .BeNull();
+    }
+
+    [Fact]
+    public void Validate_rejects_an_unreadable_protected_reference()
+    {
+        new DeletionCriteria { ExcludedMessageIds = ["not-an-id"] }
+            .Validate()
+            .Should()
+            .NotBeNull();
+    }
+
+    [Fact]
+    public void Normalizes_excluded_message_links_to_ids()
+    {
+        var criteria = new DeletionCriteria
+        {
+            ExcludedMessageIds =
+            [
+                "https://discord.com/channels/111/222/123456789012345678",
+                "987654321098765432",
+            ],
+        }.WithNormalizedReferences();
+
+        criteria
+            .ExcludedMessageIds.Should()
+            .BeEquivalentTo("123456789012345678", "987654321098765432");
+    }
+
+    [Fact]
     public void Canonical_json_is_order_independent()
     {
         var a = new DeletionCriteria { ExcludedChannelIds = ["1", "2", "3"] };

@@ -108,4 +108,4 @@ you are asked to preview again.
 
 - Media recovery needs the attachment's message to still exist (to get a fresh signed URL); if a
   message was deleted, its attachment can't be recovered.
-- DM deletion is out of scope; deletion is offered for servers only. DMs can still be exported.
+- Direct messages are out of scope in this version — neither exported nor deleted. Only servers you are a member of are listed.

@@ -56,11 +56,13 @@ public static class ApiEndpoints
                 CancellationToken ct
             ) =>
             {
-                if (jobs.IsBusy)
-                    return Results.Conflict(new { error = "A job is running." });
                 if (string.IsNullOrWhiteSpace(body.Token))
                     return Results.BadRequest(new { error = "Token is required." });
 
+                // Hold the session-change gate across the whole sign-in so a job can't start
+                // against the old account mid-swap (R4).
+                if (!jobs.TryBeginSessionChange())
+                    return Results.Conflict(new { error = "A job is running." });
                 try
                 {
                     var state = await session.SignInAsync(body.Token.Trim(), ct);
@@ -72,6 +74,10 @@ public static class ApiEndpoints
                 {
                     return Results.BadRequest(new { error = ex.Message });
                 }
+                finally
+                {
+                    jobs.EndSessionChange();
+                }
             }
         );
 
@@ -79,10 +85,17 @@ public static class ApiEndpoints
             "/api/session",
             (DiscordSession session, JobManager jobs) =>
             {
-                if (jobs.IsBusy)
+                if (!jobs.TryBeginSessionChange())
                     return Results.Conflict(new { error = "A job is running." });
-                session.SignOut();
-                return Results.Ok();
+                try
+                {
+                    session.SignOut();
+                    return Results.Ok();
+                }
+                finally
+                {
+                    jobs.EndSessionChange();
+                }
             }
         );
     }
@@ -167,6 +180,12 @@ public static class ApiEndpoints
                     return Results.BadRequest(new { error = "Invalid server ID." });
 
                 var guildId = Snowflake.Parse(body.GuildId);
+                // DMs are out of scope for v1 (export and deletion). Reject the DM pseudo-guild
+                // server-side so a direct API call can't create a run the UI never offers (R6).
+                if (guildId == Guild.DirectMessages.Id)
+                    return Results.BadRequest(
+                        new { error = "Direct messages aren't supported — choose a server." }
+                    );
                 var options = body.Options ?? new ExportOptions();
 
                 var job = jobs.TryStart(
@@ -183,7 +202,8 @@ public static class ApiEndpoints
                             registry
                         );
                         await exportJob.RunAsync(j, ct);
-                    }
+                    },
+                    () => ReferenceEquals(session.Current, state)
                 );
 
                 return job is null
@@ -243,6 +263,7 @@ public static class ApiEndpoints
                         run = new
                         {
                             run?.RunId,
+                            run?.GuildId,
                             run?.GuildName,
                             run?.MeUserId,
                             run?.TokenKind,
@@ -290,13 +311,50 @@ public static class ApiEndpoints
                         {
                             m.Id,
                             m.ChannelId,
+                            m.AuthorId,
                             m.AuthorName,
+                            m.AuthorAvatarUrl,
                             m.Timestamp,
                             m.Content,
                             m.IsPinned,
                             m.AttachmentCount,
+                            m.EmbedCount,
                             m.Keep,
                             deleteStatus = m.DeleteStatus.ToString(),
+                            attachments = (m.Attachments ?? []).Select(a => new
+                            {
+                                a.FileName,
+                                a.LocalName,
+                                a.Url,
+                                a.Kind,
+                                a.IsSpoiler,
+                            }),
+                            stickers = (m.Stickers ?? []).Select(s => new
+                            {
+                                s.Name,
+                                s.Url,
+                                s.IsImage,
+                            }),
+                            forwarded = m.Forwarded is null
+                                ? null
+                                : new
+                                {
+                                    m.Forwarded.Content,
+                                    stickers = m.Forwarded.Stickers.Select(s => new
+                                    {
+                                        s.Name,
+                                        s.Url,
+                                        s.IsImage,
+                                    }),
+                                    attachments = m.Forwarded.Attachments.Select(a => new
+                                    {
+                                        a.FileName,
+                                        a.LocalName,
+                                        a.Url,
+                                        a.Kind,
+                                        a.IsSpoiler,
+                                    }),
+                                },
                         }),
                     }
                 );
@@ -336,7 +394,8 @@ public static class ApiEndpoints
                         var manifest = registry.OpenManifest(dir);
                         var retry = new MediaRetryJob(state.Client, manifest, dir);
                         await retry.RunAsync(j, ct);
-                    }
+                    },
+                    () => ReferenceEquals(session.Current, state)
                 );
 
                 return job is null
@@ -364,15 +423,20 @@ public static class ApiEndpoints
                 if (manifest is null)
                     return Results.NotFound();
 
-                var deletingUserId = state.User.Id.ToString();
-                var plan = DeletionPlanner.BuildPlan(
-                    manifest.GetChannels(),
-                    manifest.GetAllMessages(),
-                    criteria,
-                    deletingUserId
-                );
+                // Reject bad dates / references up front so a typo can never widen the deletion,
+                // then resolve any pasted links to raw IDs server-side (R1/R2).
+                var validationError = criteria.Validate();
+                if (validationError is not null)
+                    return Results.BadRequest(new { error = validationError });
+                criteria = criteria.WithNormalizedReferences();
 
-                var revision = manifest.GetManifestRevision();
+                var deletingUserId = state.User.Id.ToString();
+
+                // Read channels, messages and revision from one consistent snapshot so the plan's
+                // candidates and its stamped revision can never disagree (R3).
+                var (revision, channels, messages) = manifest.ReadPlanningSnapshot();
+                var plan = DeletionPlanner.BuildPlan(channels, messages, criteria, deletingUserId);
+
                 var planId = PlanIdentity.Compute(
                     runId,
                     criteria.ToCanonicalJson(),
@@ -391,7 +455,39 @@ public static class ApiEndpoints
                 );
                 await manifest.FlushAsync();
 
+                // A short sample of what will actually be deleted, per channel, for the UI.
+                var candidateSet = plan.CandidateMessageIds.ToHashSet(StringComparer.Ordinal);
+                var channelNames = channels.ToDictionary(
+                    c => c.Id,
+                    c => c.HierarchicalName,
+                    StringComparer.Ordinal
+                );
+                var samples = messages
+                    .Where(m => candidateSet.Contains(m.Id))
+                    .GroupBy(m => m.ChannelId, StringComparer.Ordinal)
+                    .Select(g => new
+                    {
+                        channelId = g.Key,
+                        channelName = channelNames.GetValueOrDefault(g.Key, g.Key),
+                        count = g.Count(),
+                        sample = g.Take(4)
+                            .Select(m => new
+                            {
+                                m.AuthorName,
+                                m.Timestamp,
+                                content = Preview(m.Content),
+                            })
+                            .ToArray(),
+                    })
+                    .OrderByDescending(x => x.count)
+                    .ToArray();
+
                 var run = manifest.GetRun();
+                var mismatch = run is not null && run.MeUserId != deletingUserId;
+                var confirmText = mismatch
+                    ? $"{run!.GuildName} / {state.User.Name}"
+                    : run?.GuildName;
+
                 return Results.Ok(
                     new
                     {
@@ -399,9 +495,11 @@ public static class ApiEndpoints
                         totalCandidates = plan.TotalCandidates,
                         totalKept = plan.TotalKept,
                         channels = plan.ChannelSummaries,
+                        samples,
                         deletingUser = Describe(state.User),
                         exportingUserId = run?.MeUserId,
-                        accountMismatch = run?.MeUserId != deletingUserId,
+                        accountMismatch = mismatch,
+                        confirmText,
                     }
                 );
             }
@@ -446,7 +544,13 @@ public static class ApiEndpoints
                 }
 
                 var run = manifest.GetRun();
-                var expectedConfirm = run?.GuildName ?? "";
+                // When the deleting account differs from the account that made the backup, the
+                // typed confirmation must also name the deleting account, so the risk is explicit
+                // (R4). Otherwise the server name alone confirms.
+                var mismatch = run is not null && run.MeUserId != deletingUserId;
+                var expectedConfirm = mismatch
+                    ? $"{run!.GuildName} / {state.User.Name}"
+                    : run?.GuildName ?? "";
                 if (
                     !body.DryRun
                     && !string.Equals(
@@ -457,7 +561,13 @@ public static class ApiEndpoints
                 )
                 {
                     return Results.BadRequest(
-                        new { error = "Type the server name exactly to confirm." }
+                        new
+                        {
+                            error = mismatch
+                                ? "Type the server name and your username exactly to confirm."
+                                : "Type the server name exactly to confirm.",
+                            expected = expectedConfirm,
+                        }
                     );
                 }
 
@@ -475,7 +585,8 @@ public static class ApiEndpoints
                             body.DryRun
                         );
                         await deletionJob.RunAsync(j, ct);
-                    }
+                    },
+                    () => ReferenceEquals(session.Current, state)
                 );
 
                 return job is null
@@ -535,18 +646,34 @@ public static class ApiEndpoints
                 ctx.Response.Headers.CacheControl = "no-cache";
                 ctx.Response.Headers["X-Accel-Buffering"] = "no";
 
-                var reader = job.Subscribe();
-                await foreach (var evt in reader.ReadAllAsync(ctx.RequestAborted))
+                using var subscription = job.Subscribe();
+                try
                 {
-                    var json = System.Text.Json.JsonSerializer.Serialize(evt.Payload);
-                    await ctx.Response.WriteAsync(
-                        $"event: {evt.Type}\ndata: {json}\n\n",
-                        ctx.RequestAborted
-                    );
-                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                    await foreach (var evt in subscription.Reader.ReadAllAsync(ctx.RequestAborted))
+                    {
+                        var json = System.Text.Json.JsonSerializer.Serialize(evt.Payload);
+                        await ctx.Response.WriteAsync(
+                            $"event: {evt.Type}\ndata: {json}\n\n",
+                            ctx.RequestAborted
+                        );
+                        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    // Client disconnected; the using-block unregisters the subscription.
                 }
             }
         );
+    }
+
+    // A short, single-line snippet of a message's text for preview samples.
+    private static string Preview(string? content)
+    {
+        if (string.IsNullOrWhiteSpace(content))
+            return "";
+        var flat = content.ReplaceLineEndings(" ").Trim();
+        return flat.Length <= 140 ? flat : flat[..140] + "…";
     }
 
     private static object Describe(User user) =>
