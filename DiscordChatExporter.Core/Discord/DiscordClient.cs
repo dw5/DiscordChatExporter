@@ -879,55 +879,43 @@ public class DiscordClient(
         }
     }
 
-    public async IAsyncEnumerable<Message> GetMessagesAsync(
+    // Original public signature, preserved unchanged for existing (incl. external) callers.
+    public IAsyncEnumerable<Message> GetMessagesAsync(
         Snowflake channelId,
         Snowflake? after = null,
         Snowflake? before = null,
         IProgress<Percentage>? progress = null,
-        bool strict = false,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default
-    )
-    {
-        await foreach (
-            var message in GetMessagesAsync(
-                channelId,
-                after,
-                before,
-                progress,
-                false,
-                strict,
-                cancellationToken
-            )
-        )
-        {
-            yield return message;
-        }
-    }
+        CancellationToken cancellationToken = default
+    ) => GetMessagesAsync(channelId, after, before, progress, false, false, cancellationToken);
 
-    public async IAsyncEnumerable<Message> GetMessagesInReverseAsync(
+    // Strict-capable overload. `strict` is required (no default) and sits before an optional
+    // cancellationToken, so it is never ambiguous with the original overload above and a positional
+    // GetMessagesAsync(id, after, before, progress, ct) still binds the original.
+    public IAsyncEnumerable<Message> GetMessagesAsync(
+        Snowflake channelId,
+        Snowflake? after,
+        Snowflake? before,
+        IProgress<Percentage>? progress,
+        bool strict,
+        CancellationToken cancellationToken = default
+    ) => GetMessagesAsync(channelId, after, before, progress, false, strict, cancellationToken);
+
+    public IAsyncEnumerable<Message> GetMessagesInReverseAsync(
         Snowflake channelId,
         Snowflake? after = null,
         Snowflake? before = null,
         IProgress<Percentage>? progress = null,
-        bool strict = false,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default
-    )
-    {
-        await foreach (
-            var message in GetMessagesAsync(
-                channelId,
-                after,
-                before,
-                progress,
-                true,
-                strict,
-                cancellationToken
-            )
-        )
-        {
-            yield return message;
-        }
-    }
+        CancellationToken cancellationToken = default
+    ) => GetMessagesAsync(channelId, after, before, progress, true, false, cancellationToken);
+
+    public IAsyncEnumerable<Message> GetMessagesInReverseAsync(
+        Snowflake channelId,
+        Snowflake? after,
+        Snowflake? before,
+        IProgress<Percentage>? progress,
+        bool strict,
+        CancellationToken cancellationToken = default
+    ) => GetMessagesAsync(channelId, after, before, progress, true, strict, cancellationToken);
 
     public async IAsyncEnumerable<User> GetMessageReactionsAsync(
         Snowflake channelId,
