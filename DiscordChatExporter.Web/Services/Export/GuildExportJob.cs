@@ -175,6 +175,10 @@ public sealed class GuildExportJob(
                         )
                         {
                             LinkFailedAttachmentsLocally = options.DownloadMedia,
+                            // Fail a channel loudly if its message range can't be established, so a
+                            // transient error never leaves it recorded complete-but-empty and then
+                            // treated as a full backup by deletion.
+                            StrictMessageDiscovery = true,
                         })
                         .ToArray();
 

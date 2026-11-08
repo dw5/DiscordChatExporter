@@ -708,6 +708,7 @@ public class DiscordClient(
     private async ValueTask<Message?> TryGetFirstMessageAsync(
         Snowflake channelId,
         Snowflake? after = null,
+        bool strict = false,
         CancellationToken cancellationToken = default
     )
     {
@@ -717,8 +718,10 @@ public class DiscordClient(
             .SetQueryParameter("after", (after ?? Snowflake.Zero).ToString())
             .Build();
 
-        // Can be null on channels that the user cannot access
-        var response = await TryGetJsonResponseAsync(url, cancellationToken);
+        // Null means the channel is inaccessible/empty. In strict mode a transient, auth or server
+        // error throws instead of being mistaken for "no messages" (which would silently truncate
+        // the channel's range to empty).
+        var response = await TryGetJsonResponseAsync(url, strict, cancellationToken);
         if (response is null)
             return null;
 
@@ -730,6 +733,7 @@ public class DiscordClient(
     private async ValueTask<Message?> TryGetLastMessageAsync(
         Snowflake channelId,
         Snowflake? before = null,
+        bool strict = false,
         CancellationToken cancellationToken = default
     )
     {
@@ -739,8 +743,10 @@ public class DiscordClient(
             .SetQueryParameter("before", before?.ToString())
             .Build();
 
-        // Can be null on channels that the user cannot access
-        var response = await TryGetJsonResponseAsync(url, cancellationToken);
+        // Null means the channel is inaccessible/empty. In strict mode a transient, auth or server
+        // error throws instead of being mistaken for "no messages" (which would silently truncate
+        // the channel's range to empty).
+        var response = await TryGetJsonResponseAsync(url, strict, cancellationToken);
         if (response is null)
             return null;
 
@@ -753,6 +759,7 @@ public class DiscordClient(
         Snowflake? before,
         IProgress<Percentage>? progress,
         bool isReverse,
+        bool strict,
         [EnumeratorCancellation] CancellationToken cancellationToken
     )
     {
@@ -772,8 +779,8 @@ public class DiscordClient(
         // This snapshotting also has the side benefit of allowing us to calculate progress by comparing
         // the timestamps of the Alpha message, Omega message, and the message being currently processed.
         var omegaMessage = !isReverse
-            ? await TryGetLastMessageAsync(channelId, before, cancellationToken)
-            : await TryGetFirstMessageAsync(channelId, after, cancellationToken);
+            ? await TryGetLastMessageAsync(channelId, before, strict, cancellationToken)
+            : await TryGetFirstMessageAsync(channelId, after, strict, cancellationToken);
 
         // If the Omega doesn't exist or falls outside of the range, then there are simply no messages
         // satisfying the specified range.
@@ -877,6 +884,7 @@ public class DiscordClient(
         Snowflake? after = null,
         Snowflake? before = null,
         IProgress<Percentage>? progress = null,
+        bool strict = false,
         [EnumeratorCancellation] CancellationToken cancellationToken = default
     )
     {
@@ -887,6 +895,7 @@ public class DiscordClient(
                 before,
                 progress,
                 false,
+                strict,
                 cancellationToken
             )
         )
@@ -900,6 +909,7 @@ public class DiscordClient(
         Snowflake? after = null,
         Snowflake? before = null,
         IProgress<Percentage>? progress = null,
+        bool strict = false,
         [EnumeratorCancellation] CancellationToken cancellationToken = default
     )
     {
@@ -910,6 +920,7 @@ public class DiscordClient(
                 before,
                 progress,
                 true,
+                strict,
                 cancellationToken
             )
         )

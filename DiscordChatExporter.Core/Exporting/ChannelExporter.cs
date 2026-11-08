@@ -118,6 +118,7 @@ public class ChannelExporter(DiscordClient discord)
                     request.After,
                     request.Before,
                     progress,
+                    request.StrictMessageDiscovery,
                     cancellationToken
                 )
                 : discord.GetMessagesInReverseAsync(
@@ -125,6 +126,7 @@ public class ChannelExporter(DiscordClient discord)
                     request.After,
                     request.Before,
                     progress,
+                    request.StrictMessageDiscovery,
                     cancellationToken
                 );
 

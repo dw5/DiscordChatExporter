@@ -52,6 +52,13 @@ public partial class ExportRequest
     // recovered later. Has no effect unless assets are being downloaded.
     public bool LinkFailedAttachmentsLocally { get; init; }
 
+    // When set, message discovery fails loudly instead of silently treating a transient/auth/server
+    // error while establishing a channel's message range as "no messages". This keeps a channel from
+    // being reported complete-but-empty when its crawl never actually ran — important for the web UI,
+    // which then marks such a channel failed and excludes it from backup-gated deletion. Default off,
+    // so the CLI and desktop GUI keep today's best-effort behaviour.
+    public bool StrictMessageDiscovery { get; init; }
+
     public ExportRequest(
         Guild guild,
         Channel channel,
